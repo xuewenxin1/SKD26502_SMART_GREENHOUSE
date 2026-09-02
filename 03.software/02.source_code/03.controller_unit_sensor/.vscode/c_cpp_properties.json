@@ -1,0 +1,33 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/system/drivers/motor",
+                "${workspaceFolder}/system/drivers/console",
+                "${workspaceFolder}/system/drivers/lte",
+                "${workspaceFolder}/system/drivers/aht2415",
+                "${workspaceFolder}/system/drivers/twi",
+                "${workspaceFolder}/system/drivers/tm1750",
+                "${workspaceFolder}/app/gui",
+                "${workspaceFolder}/system/drivers/adc",
+                "${workspaceFolder}/system/drivers/rain_sensor",
+                "${workspaceFolder}/system/drivers/ntc",
+                "${workspaceFolder}/app/env",
+                "${workspaceFolder}/system/drivers/config",
+                "${workspaceFolder}/app/systimer",
+                "${workspaceFolder}/app/ventilate_service"
+            ],
+            "defines": [
+                "PY32L090xC",
+                "USE_HAL_DRIVER"
+            ],
+            "compilerPath": "/usr/bin/clang",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-clang-x64"
+        }
+    ],
+    "version": 4
+}
