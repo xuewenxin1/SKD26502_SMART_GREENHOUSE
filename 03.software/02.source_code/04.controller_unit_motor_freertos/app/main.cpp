@@ -70,7 +70,11 @@ int main(){
 
     LOG_INFO("System init complete.");
 
-    /* 启动服务. */
+    /* 启动服务：IOT 先建，堆只剩约 1KB 时后建会失败导致无法联网. */
+    if ( IOTService::start() != true ){
+        LOG_ERROR("IOT service start failed.");
+    }
+
     if ( GUI::start() != true ){
         LOG_ERROR("GUI service start failed.");
         return -2;
@@ -79,10 +83,6 @@ int main(){
     if ( Env::start() != true ){
         LOG_ERROR("Env service start failed.");
         return -2;
-    }
-
-    if ( IOTService::start() != true ){
-        LOG_ERROR("IOT service start failed.");
     }
 
     size_t free_heap_size = xPortGetFreeHeapSize();

@@ -19,6 +19,10 @@
 | 路径 | 作用 |
 |------|------|
 | `scripts/build_firmware.ps1` | 编译 / 烧录脚本（F7、F8 会调用） |
+| **`烧录包/`** | **整夹拷走即可烧录**：bin + bat（motor/sensor 已标识） |
+| `烧录包/SKD26502_motor.bin` + `flash_motor.bat` | 放风机 |
+| `烧录包/SKD26502_sensor.bin` + `flash_sensor.bat` | 温湿度计 |
+| `烧录包/setup_flash_env.bat` | 首次安装便携烧录环境 |
 
 下面这些是旧工程或资料，**一般不用改**：
 
@@ -46,25 +50,37 @@
 
 ## 3. 最近改了哪些问题？（按功能）
 
-### ① 自动模式：温度越高，风机开度越大
+### ① 自动模式：按 P5/P6 上下限回差开/关
 
-**问题/需求：** 实测温度比目标温度（P1）高得越多，放风机开得越大。  
-**规则：** 只算整数℃，小数直接丢掉（不四舍五入）。回差 X（P2）把整条曲线往后挪。
+**问题/需求：** 自动模式按用户设定的通风上下限控制；中间带回差，避免频繁开关。  
+**规则：** 只算整数℃。用设置页 **P5 上限**、**P6 下限**（默认 25℃ / 20℃）：
 
-| 有效温差（实测 − 目标 − X） | 开度 |
-|------------------------------|------|
-| ≤ 0℃ | 0% |
-| 2℃ | 20% |
-| 4℃ | 40% |
-| … | … |
-| ≥ 10℃ | 100% |
+| 实测温度 | 开度 |
+|----------|------|
+| ≥ P5（如 ≥25℃） | 100% 全开 |
+| ≤ P6（如 ≤20℃） | 0% 全关 |
+| P6 < T < P5（如 21～24℃） | **保持原状**（升未到上限不开，降未到下限不关） |
 
 **主要文件：**
 
-- `app/ventilate_service/ventilate_service.cpp` → 函数 `opening_from_temp_delta`
-- `system/drivers/config/config.cpp` → 回差默认值、限制 0～5℃
+- `app/ventilate_service/ventilate_service.cpp` → 函数 `opening_from_temp_limits`
+- A1/A2 仍只作报警上下限；P5/P6 专管通风开合
 
 两套固件都有同样逻辑。
+
+---
+
+### ①b 上电不归零、C1 圈数 + C2 秒/圈
+
+**问题/需求：**
+1. 上电不主动转、不找零；屏幕显示上次停稳开度。
+2. **C1** 行程圈数（1～99）；**C2** 一圈多少秒（1～99，默认 25）。满行程 = C1×C2 秒。
+
+**主要文件：**
+
+- `app/ventilate_service/ventilate_service.cpp` → `init` 不再调用 `align`；行程用 `motor_stroke_time × motor_turn_seconds`
+- `system/drivers/config/config.hpp` → `temp_vent_*`、`motor_turn_seconds`
+- `app/gui/gui.cpp` → 设置项 P5/P6/C1/C2
 
 ---
 
@@ -210,9 +226,11 @@ NTC 已改为 **B 值法**（B=3950、25℃ 阻值 10kΩ、板上串联上拉 **
 
 | 内容 | 大致位置 |
 |------|----------|
-| 开机找零：连续 3 次电流≈0 才断电 | `ventilate_service` |
+| 开机不归零：保持上次开度，电机不动 | `ventilate_service` |
 | 开度只在电机停稳约 0.5 秒后写入 Flash | `ventilate_service` |
-| C1 行程 30～999 秒 | `gui` + `config` |
+| C1 圈数(1～999) + C2 秒/圈(10～100) | `gui` + `config` |
+| 退出设置不覆盖 MQTT 下发的工作模式 | `gui` |
+| MQTT config 含 C1/C2/P5/P6；status 报当前圈数（不×10） | `iot` |
 | MQTT `up/dev`：放风机类型 1、温湿度计类型 2 | `iot` |
 
 ---
@@ -221,7 +239,7 @@ NTC 已改为 **B 值法**（B=3950、25℃ 阻值 10kΩ、板上串联上拉 **
 
 | 功能 | 主要文件夹 | 关键文件 |
 |------|------------|----------|
-| 自动开度随温差 | `.../app/ventilate_service/` | `ventilate_service.cpp` |
+| 自动开度按 P5/P6 上下限 | `.../app/ventilate_service/` | `ventilate_service.cpp` |
 | 回差 0～5、默认 0 | `.../app/gui/` + `.../system/drivers/config/` | `gui.cpp`、`config.cpp` |
 | 隐藏 D1～D4 / P0 / P3 | `.../app/gui/` | `gui.cpp`（`GUI_ENABLE_D1_D4_SETTING`、`GUI_ENABLE_P0_P3_SETTING`） |
 | S0 上报间隔 5～30 写 Flash | `.../app/gui/` + `.../system/drivers/config/` + `.../app/iot/` | `gui.cpp`、`config.cpp`、`iot_service.cpp` |
@@ -258,4 +276,4 @@ NTC 已改为 **B 值法**（B=3950、25℃ 阻值 10kΩ、板上串联上拉 **
 - 需要定时功能时：把 `GUI_ENABLE_D1_D4_SETTING` 改回 `1`
 - 需要 P0/P3 时：把 `GUI_ENABLE_P0_P3_SETTING` 改回 `1`
 - 蜂鸣器若要改频率：改 `env.cpp` 里的 `BUZZER_FREQ_HZ`（当前 4000）
-- 自动开度曲线若要再调：改 `ventilate_service.cpp` 里的 `opening_from_temp_delta`
+- 自动开度上下限若要再调：改 `ventilate_service.cpp` 里的 `opening_from_temp_limits`

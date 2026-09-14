@@ -4,6 +4,8 @@
 #include "py32f071_hal_gpio.h"
 #include "py32f071_hal_rcc.h"
 #include "console_logger.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #define PORT_TM1750_SCL GPIOB
 #define PIN_TM1750_SCL GPIO_PIN_8
@@ -102,5 +104,9 @@ bool TM1750_Service::flush(){
     if ( tm1750 == nullptr ){
         return false;
     }
-    return tm1750->flush();
+    /* 软件 I2C 不能被 Flash/其它任务打断，否则 TM1750 会停在最后一帧. */
+    taskENTER_CRITICAL();
+    bool ok = tm1750->flush();
+    taskEXIT_CRITICAL();
+    return ok;
 }

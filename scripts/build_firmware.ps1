@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("motor", "sensor", "adc_test", "all")]
+    [ValidateSet("motor", "sensor", "adc_test", "buzzer_sweep", "all")]
     [string]$Target,
     [switch]$Flash
 )
@@ -65,6 +65,7 @@ function Flash-Firmware {
 $MotorDir = Join-Path $RepoRoot "03.software\02.source_code\04.controller_unit_motor_freertos"
 $SensorDir = Join-Path $RepoRoot "03.software\02.source_code\04.controller_unit_sensor_freertos"
 $AdcTestDir = Join-Path $RepoRoot "03.software\02.source_code\05.adc_motor_test"
+$BuzzerSweepDir = Join-Path $RepoRoot "03.software\02.source_code\06.sensor_buzzer_sweep"
 
 if ($Target -eq "motor" -or $Target -eq "all") {
     Build-Firmware -SourceDir $MotorDir
@@ -74,6 +75,9 @@ if ($Target -eq "sensor" -or $Target -eq "all") {
 }
 if ($Target -eq "adc_test" -or $Target -eq "all") {
     Build-Firmware -SourceDir $AdcTestDir
+}
+if ($Target -eq "buzzer_sweep" -or $Target -eq "all") {
+    Build-Firmware -SourceDir $BuzzerSweepDir
 }
 
 Write-Host "Build OK: $Target"
@@ -87,5 +91,8 @@ if ($Flash) {
     }
     if ($Target -eq "adc_test" -or $Target -eq "all") {
         Flash-Firmware -SourceDir $AdcTestDir -HexName "ADC_MOTOR_TEST.hex"
+    }
+    if ($Target -eq "buzzer_sweep" -or $Target -eq "all") {
+        Flash-Firmware -SourceDir $BuzzerSweepDir
     }
 }

@@ -31,6 +31,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "task.h"
 #include "py32f071_it.h"
+#include "py32f0xx_hal.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* Private typedef -----------------------------------------------------------*/
@@ -86,8 +87,7 @@ void PendSV_Handler(void)
   */
 void SysTick_Handler(void)
 {
-  /* Get system tick value */
-/*  HAL_IncTick(); */ 
+  HAL_IncTick();
 
   /* Check whether the task scheduler is enabled */
   if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)

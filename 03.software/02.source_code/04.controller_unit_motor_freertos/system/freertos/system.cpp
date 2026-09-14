@@ -121,7 +121,7 @@ void system_entry(){
     }else{
         LOG_INFO("Console logger init complete.");
     }
-    if ( xTaskCreate(system_main_task,"Main",512,nullptr,10,&system_main_task_handler) == pdPASS ){
+    if ( xTaskCreate(system_main_task,"Main",512,nullptr,3,&system_main_task_handler) == pdPASS ){
         vTaskStartScheduler();  /* 启动调度器。 */
     }
 

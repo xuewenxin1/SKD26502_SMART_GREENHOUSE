@@ -98,6 +98,9 @@ void Motor::eventloop(){
         if ( this->home_seek ){
             /* 找零：不停机，由上层连续 3 次电流 0 再停. */
             this->stop_cnt = 0;
+        }else if ( this->ignore_stall ){
+            /* 定点/强制行程中途：忽略假零流，避免反复停机把调度/日志打爆、屏停住. */
+            this->stop_cnt = 0;
         }else if ( this->limit_ignore_cnt > 0 ){
             this->stop_cnt = 0;
         }else if ( stop_cnt < MOTOR_LIMIT_CONFIRM_TICKS ){

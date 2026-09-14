@@ -29,11 +29,14 @@ enum SettingItem {
     SettingItem_P2,
     SettingItem_P3,
     SettingItem_P4,
+    SettingItem_P5,
+    SettingItem_P6,
     SettingItem_D1,
     SettingItem_D2,
     SettingItem_D3,
     SettingItem_D4,
     SettingItem_C1,
+    SettingItem_C2,
     SettingItem_S0,
     SettingItem_S2,
     SettingItem_Count,
@@ -47,11 +50,14 @@ static const char setting_item_codes[][2] = {
     [SettingItem_P2] = {'p','2'},
     [SettingItem_P3] = {'p','3'},
     [SettingItem_P4] = {'p','4'},
+    [SettingItem_P5] = {'p','5'},
+    [SettingItem_P6] = {'p','6'},
     [SettingItem_D1] = {'d','1'},
     [SettingItem_D2] = {'d','2'},
     [SettingItem_D3] = {'d','3'},
     [SettingItem_D4] = {'d','4'},
     [SettingItem_C1] = {'c','1'},
+    [SettingItem_C2] = {'c','2'},
     [SettingItem_S0] = {'s','0'},
     [SettingItem_S2] = {'s','2'},
 };
@@ -60,6 +66,7 @@ Page current_page = Page::Home;
 bool config_modified_flag = false;
 static SettingItem curr_setting_item = SettingItem_A1;
 static Config_t config;
+static Config_t config_on_enter;
 static unsigned int blink_count = 0;
 static unsigned int anim_count = 0;
 static bool blink_flag = false;
@@ -237,18 +244,39 @@ bool change_page(Page target){
             LOG_DEBUG("Enter Home page.");
             if ( GUI::current_page == Page::MotorCali ){
                 /* 自动校准已把行程写入 C1，回读以免设置页仍显示旧值. */
-                ConfigService::get_config(GUI::config);
+                ConfigService::get_config(config);
                 GUI::config_modified_flag = false;
             }else if ( config_modified_flag ){
-                Config_t old_config;
-                ConfigService::get_config(old_config);
-                const int old_stroke = old_config.motor_stroke_time;
-                GUI::config.last_opening_percentage = old_config.last_opening_percentage;
-                ConfigService::set_config(GUI::config);
+                Config_t live_config;
+                ConfigService::get_config(live_config);
+                const int old_stroke = live_config.motor_stroke_time;
+                const int old_turn_sec = live_config.motor_turn_seconds;
+                if ( config.motor_stroke_time == config_on_enter.motor_stroke_time ){
+                    config.motor_stroke_time = live_config.motor_stroke_time;
+                }
+                if ( config.motor_turn_seconds == config_on_enter.motor_turn_seconds ){
+                    config.motor_turn_seconds = live_config.motor_turn_seconds;
+                }
+                if ( config.temp_vent_upper_limit == config_on_enter.temp_vent_upper_limit ){
+                    config.temp_vent_upper_limit = live_config.temp_vent_upper_limit;
+                }
+                if ( config.temp_vent_lower_limit == config_on_enter.temp_vent_lower_limit ){
+                    config.temp_vent_lower_limit = live_config.temp_vent_lower_limit;
+                }
+                if ( config.temp_alert_upper_limit == config_on_enter.temp_alert_upper_limit ){
+                    config.temp_alert_upper_limit = live_config.temp_alert_upper_limit;
+                }
+                if ( config.temp_alert_lower_limit == config_on_enter.temp_alert_lower_limit ){
+                    config.temp_alert_lower_limit = live_config.temp_alert_lower_limit;
+                }
+                config.working_mode = live_config.working_mode;
+                config.last_opening_percentage = live_config.last_opening_percentage;
+                config.last_motor_timer_cnt = live_config.last_motor_timer_cnt;
+                ConfigService::set_config(config);
                 ConfigService::store();
                 GUI::config_modified_flag = false;
-                /* 手动改完 C1：电机先回 0，再按新行程走. */
-                if ( GUI::config.motor_stroke_time != old_stroke ){
+                if ( (config.motor_stroke_time != old_stroke)
+                     || (config.motor_turn_seconds != old_turn_sec) ){
                     VentilateService::home_after_stroke_change();
                 }
             }
@@ -258,7 +286,8 @@ bool change_page(Page target){
         case Page::Setting: {
             /* 在主页下长按设置键进入设置页面. */
             LOG_DEBUG("Enter setting page.");
-            ConfigService::get_config(GUI::config);
+            ConfigService::get_config(config);
+            config_on_enter = config;
             GUI::config_modified_flag = false;
             GUI::current_page = Page::Setting;
             GUI::setting_page_auto_exit_count = 0;
@@ -270,8 +299,10 @@ bool change_page(Page target){
             if ( config_modified_flag ){
                 Config_t live_config;
                 ConfigService::get_config(live_config);
-                GUI::config.last_opening_percentage = live_config.last_opening_percentage;
-                ConfigService::set_config(GUI::config);
+                config.working_mode = live_config.working_mode;
+                config.last_opening_percentage = live_config.last_opening_percentage;
+                config.last_motor_timer_cnt = live_config.last_motor_timer_cnt;
+                ConfigService::set_config(config);
                 ConfigService::store();
                 GUI::config_modified_flag = false;
             }
@@ -349,6 +380,16 @@ bool refresh_setting_page(){
             Display::set_num_seg(Display::NUM_SEG_TEMP_S3, '0' + (value % 10) );
             Display::set_pixel(Display::PIX_TEMP_DOT,1);
         }
+    }else if ( SettingItem_P5 == curr_setting_item ){
+        if ( blink_flag ){
+            Display::set_num_seg(Display::NUM_SEG_TEMP_S1, '0' + ((config.temp_vent_upper_limit % 1000) / 100) );
+            Display::set_num_seg(Display::NUM_SEG_TEMP_S2, '0' + (config.temp_vent_upper_limit % 100) / 10 );
+        }
+    }else if ( SettingItem_P6 == curr_setting_item ){
+        if ( blink_flag ){
+            Display::set_num_seg(Display::NUM_SEG_TEMP_S1, '0' + ((config.temp_vent_lower_limit % 1000) / 100) );
+            Display::set_num_seg(Display::NUM_SEG_TEMP_S2, '0' + (config.temp_vent_lower_limit % 100) / 10 );
+        }
 #if GUI_ENABLE_D1_D4_SETTING
     }else if ( (SettingItem_D1 <= curr_setting_item) && (SettingItem_D4 >= curr_setting_item) ){
         int index = curr_setting_item - SettingItem_D1;
@@ -369,16 +410,29 @@ bool refresh_setting_page(){
 #endif
     }else if ( SettingItem::SettingItem_C1 == curr_setting_item ){
         if ( blink_flag ){
-            /* 电机行程时间 C1，范围 30-999 秒. */
+            /* 电机行程圈数 C1，范围 1-999 圈. */
             int stroke = config.motor_stroke_time;
-            if ( stroke < MOTOR_STROKE_TIME_MIN ){
-                stroke = MOTOR_STROKE_TIME_MIN;
-            }else if ( stroke > MOTOR_STROKE_TIME_MAX ){
-                stroke = MOTOR_STROKE_TIME_MAX;
+            if ( stroke < MOTOR_STROKE_TURNS_MIN ){
+                stroke = MOTOR_STROKE_TURNS_MIN;
+            }else if ( stroke > MOTOR_STROKE_TURNS_MAX ){
+                stroke = MOTOR_STROKE_TURNS_MAX;
             }
             Display::set_num_seg(Display::NUM_SEG_TEMP_S1, '0' + (stroke % 1000) / 100 );
             Display::set_num_seg(Display::NUM_SEG_TEMP_S2, '0' + (stroke % 100) / 10 );
             Display::set_num_seg(Display::NUM_SEG_TEMP_S3, '0' + (stroke % 10) );
+        }
+    }else if ( SettingItem::SettingItem_C2 == curr_setting_item ){
+        if ( blink_flag ){
+            /* 一圈秒数 C2，范围 5-100 秒. */
+            int sec = config.motor_turn_seconds;
+            if ( sec < MOTOR_TURN_SECONDS_MIN ){
+                sec = MOTOR_TURN_SECONDS_MIN;
+            }else if ( sec > MOTOR_TURN_SECONDS_MAX ){
+                sec = MOTOR_TURN_SECONDS_MAX;
+            }
+            Display::set_num_seg(Display::NUM_SEG_TEMP_S1, '0' + (sec % 1000) / 100 );
+            Display::set_num_seg(Display::NUM_SEG_TEMP_S2, '0' + (sec % 100) / 10 );
+            Display::set_num_seg(Display::NUM_SEG_TEMP_S3, '0' + (sec % 10) );
         }
     }else if ( SettingItem::SettingItem_S0 == curr_setting_item ){
         if ( blink_flag ){
@@ -520,6 +574,7 @@ bool button_callback_home_page(Button button, ButtonEvent event){
             VentilateService::force(VentilateService::ForceAction::ForceClose);
         }
     }else if ( button == Button::Mode ){
+        /* 手动 → 自动 → 定时 → 手动（与 D1-D4 设置项是否显示无关）. */
         switch ( config.working_mode ){
             case WorkingMode_Manual: config.working_mode = WorkingMode_Auto; break;
             case WorkingMode_Auto: config.working_mode = WorkingMode_Timing; break;
@@ -560,11 +615,11 @@ bool setting_page_plus_button_callback(int step){
     config_modified_flag = true;
     if ( SettingItem_A1 == curr_setting_item ){
         int temp_value = (config.temp_alert_upper_limit / 10);
-        temp_value = clamp_add(temp_value, step, 0, 55);
+        temp_value = clamp_add(temp_value, step, (config.temp_alert_lower_limit / 10) + 1, TEMP_SETTING_MAX);
         config.temp_alert_upper_limit = temp_value * 10;
     }else if ( SettingItem_A2 == curr_setting_item ){
         int temp_value = (config.temp_alert_lower_limit / 10);
-        temp_value = clamp_add(temp_value, step, 0, (config.temp_alert_upper_limit / 10));
+        temp_value = clamp_add(temp_value, step, TEMP_SETTING_MIN, (config.temp_alert_upper_limit / 10) - 1);
         config.temp_alert_lower_limit = temp_value * 10;
     }else if ( SettingItem_P0 == curr_setting_item ){
         switch ( config.temp_control_mode ){
@@ -574,7 +629,7 @@ bool setting_page_plus_button_callback(int step){
         }
     }else if ( SettingItem_P1 == curr_setting_item ){
         int temp_value = (config.target_central_temp / 10);
-        temp_value = clamp_add(temp_value, step, 0, 55);
+        temp_value = clamp_add(temp_value, step, TEMP_SETTING_MIN, TEMP_SETTING_MAX);
         config.target_central_temp = temp_value * 10;
     }else if ( SettingItem_P2 == curr_setting_item ){
         int temp_value = (config.temp_return_diff_positive / 10);
@@ -585,7 +640,15 @@ bool setting_page_plus_button_callback(int step){
         temp_value = clamp_add(temp_value, 1, 0, 5);
         config.temp_return_diff_negative = temp_value * 10;
     }else if ( SettingItem_P4 == curr_setting_item ){
-        config.temp_compensation_value = clamp_add(config.temp_compensation_value, step, -100, 100);
+        config.temp_compensation_value = clamp_add(config.temp_compensation_value, step, -90, 90);
+    }else if ( SettingItem_P5 == curr_setting_item ){
+        int temp_value = (config.temp_vent_upper_limit / 10);
+        temp_value = clamp_add(temp_value, step, (config.temp_vent_lower_limit / 10) + 1, TEMP_SETTING_MAX);
+        config.temp_vent_upper_limit = temp_value * 10;
+    }else if ( SettingItem_P6 == curr_setting_item ){
+        int temp_value = (config.temp_vent_lower_limit / 10);
+        temp_value = clamp_add(temp_value, step, TEMP_SETTING_MIN, (config.temp_vent_upper_limit / 10) - 1);
+        config.temp_vent_lower_limit = temp_value * 10;
 #if GUI_ENABLE_D1_D4_SETTING
     }else if ( (SettingItem_D1 <= curr_setting_item) && (SettingItem_D4 >= curr_setting_item) ){
         int index = curr_setting_item - SettingItem_D1;
@@ -597,7 +660,9 @@ bool setting_page_plus_button_callback(int step){
         }
 #endif
     }else if ( SettingItem_C1 == curr_setting_item ){
-        config.motor_stroke_time = clamp_add(config.motor_stroke_time, step, MOTOR_STROKE_TIME_MIN, MOTOR_STROKE_TIME_MAX);
+        config.motor_stroke_time = clamp_add(config.motor_stroke_time, step, MOTOR_STROKE_TURNS_MIN, MOTOR_STROKE_TURNS_MAX);
+    }else if ( SettingItem_C2 == curr_setting_item ){
+        config.motor_turn_seconds = clamp_add(config.motor_turn_seconds, step, MOTOR_TURN_SECONDS_MIN, MOTOR_TURN_SECONDS_MAX);
     }else if ( SettingItem_S0 == curr_setting_item ){
         config.data_upload_interval = clamp_add(config.data_upload_interval, step, DATA_UPLOAD_INTERVAL_MIN, DATA_UPLOAD_INTERVAL_MAX);
     }else if ( SettingItem_S2 == curr_setting_item ){
@@ -613,11 +678,11 @@ bool setting_page_minus_button_callback(int step){
     config_modified_flag = true;
     if ( SettingItem_A1 == curr_setting_item ){
         int temp_value = (config.temp_alert_upper_limit / 10);
-        temp_value = clamp_add(temp_value, -step, (config.temp_alert_lower_limit / 10), 55);
+        temp_value = clamp_add(temp_value, -step, (config.temp_alert_lower_limit / 10) + 1, TEMP_SETTING_MAX);
         config.temp_alert_upper_limit = temp_value * 10;
     }else if ( SettingItem_A2 == curr_setting_item ){
         int temp_value = (config.temp_alert_lower_limit / 10);
-        temp_value = clamp_add(temp_value, -step, 0, 55);
+        temp_value = clamp_add(temp_value, -step, TEMP_SETTING_MIN, (config.temp_alert_upper_limit / 10) - 1);
         config.temp_alert_lower_limit = temp_value * 10;
     }else if ( SettingItem_P0 == curr_setting_item ){
         switch ( config.temp_control_mode ){
@@ -627,7 +692,7 @@ bool setting_page_minus_button_callback(int step){
         }
     }else if ( SettingItem_P1 == curr_setting_item ){
         int temp_value = (config.target_central_temp / 10);
-        temp_value = clamp_add(temp_value, -step, 0, 55);
+        temp_value = clamp_add(temp_value, -step, TEMP_SETTING_MIN, TEMP_SETTING_MAX);
         config.target_central_temp = temp_value * 10;
     }else if ( SettingItem_P2 == curr_setting_item ){
         int temp_value = (config.temp_return_diff_positive / 10);
@@ -638,7 +703,15 @@ bool setting_page_minus_button_callback(int step){
         temp_value = clamp_add(temp_value, -1, 0, 5);
         config.temp_return_diff_negative = temp_value * 10;
     }else if ( SettingItem_P4 == curr_setting_item ){
-        config.temp_compensation_value = clamp_add(config.temp_compensation_value, -step, -100, 100);
+        config.temp_compensation_value = clamp_add(config.temp_compensation_value, -step, -90, 90);
+    }else if ( SettingItem_P5 == curr_setting_item ){
+        int temp_value = (config.temp_vent_upper_limit / 10);
+        temp_value = clamp_add(temp_value, -step, (config.temp_vent_lower_limit / 10) + 1, TEMP_SETTING_MAX);
+        config.temp_vent_upper_limit = temp_value * 10;
+    }else if ( SettingItem_P6 == curr_setting_item ){
+        int temp_value = (config.temp_vent_lower_limit / 10);
+        temp_value = clamp_add(temp_value, -step, TEMP_SETTING_MIN, (config.temp_vent_upper_limit / 10) - 1);
+        config.temp_vent_lower_limit = temp_value * 10;
 #if GUI_ENABLE_D1_D4_SETTING
     }else if ( (SettingItem_D1 <= curr_setting_item) && (SettingItem_D4 >= curr_setting_item) ){
         int index = curr_setting_item - SettingItem_D1;
@@ -650,7 +723,9 @@ bool setting_page_minus_button_callback(int step){
         }
 #endif
     }else if ( SettingItem_C1 == curr_setting_item ){
-        config.motor_stroke_time = clamp_add(config.motor_stroke_time, -step, MOTOR_STROKE_TIME_MIN, MOTOR_STROKE_TIME_MAX);
+        config.motor_stroke_time = clamp_add(config.motor_stroke_time, -step, MOTOR_STROKE_TURNS_MIN, MOTOR_STROKE_TURNS_MAX);
+    }else if ( SettingItem_C2 == curr_setting_item ){
+        config.motor_turn_seconds = clamp_add(config.motor_turn_seconds, -step, MOTOR_TURN_SECONDS_MIN, MOTOR_TURN_SECONDS_MAX);
     }else if ( SettingItem_S0 == curr_setting_item ){
         config.data_upload_interval = clamp_add(config.data_upload_interval, -step, DATA_UPLOAD_INTERVAL_MIN, DATA_UPLOAD_INTERVAL_MAX);
     }else if ( SettingItem_S2 == curr_setting_item ){

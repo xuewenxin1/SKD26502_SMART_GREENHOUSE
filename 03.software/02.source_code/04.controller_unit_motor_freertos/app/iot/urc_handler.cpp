@@ -29,11 +29,31 @@ UrcHandler::UrcResult MqttPublishUrcHandler::process_line(unsigned char *line_bu
             const char *str_payload_len = strtok(nullptr,",");
             const char *payload = strtok(nullptr,",");
             if ( payload != nullptr ){
-                strcpy(this->topic,str_topic);
+                /* 去掉 URC 里 topic 两侧引号. */
+                const char *tp = str_topic;
+                while ( *tp == '"' || *tp == ' ' ){
+                    tp++;
+                }
+                strncpy(this->topic, tp, sizeof(this->topic) - 1);
+                this->topic[sizeof(this->topic) - 1] = 0;
+                unsigned int tlen = (unsigned int)strlen(this->topic);
+                while ( tlen > 0 && (this->topic[tlen - 1] == '"' || this->topic[tlen - 1] == ' ') ){
+                    this->topic[tlen - 1] = 0;
+                    tlen--;
+                }
                 unsigned int line_payload_length = length - (unsigned int)(payload - (const char*)line_buffer);
+                this->total_length = atoi(str_total_len);
+                if ( (this->total_length == 0) || (this->total_length >= this->buffer_capacity) ){
+                    this->receiving = false;
+                    this->total_length = 0;
+                    this->received_length = 0;
+                    return UrcHandler::UrcResult::None;
+                }
+                if ( line_payload_length > this->buffer_capacity ){
+                    line_payload_length = this->buffer_capacity;
+                }
                 memcpy(this->buffer,payload,line_payload_length);
                 this->received_length = line_payload_length;
-                this->total_length = atoi(str_total_len);
                 if ( this->received_length < this->total_length ){
                     this->receiving = true;
                     return UrcHandler::UrcResult::WaitingNextLine;
@@ -53,6 +73,12 @@ UrcHandler::UrcResult MqttPublishUrcHandler::process_line(unsigned char *line_bu
         }
     }else{
         /* 正在接收. */
+        if ( (this->received_length + length) >= this->buffer_capacity ){
+            this->receiving = false;
+            this->total_length = 0;
+            this->received_length = 0;
+            return UrcHandler::UrcResult::None;
+        }
         memcpy(this->buffer + this->received_length, line_buffer, length);
         this->received_length += length;
         if ( this->received_length < this->total_length ){

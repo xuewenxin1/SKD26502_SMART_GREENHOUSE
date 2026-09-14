@@ -254,7 +254,7 @@ void Env_eventloop(void *param){
 }
 
 bool Env::start(){
-    if ( xTaskCreate(Env_eventloop,"env",256,nullptr,10,&task_handle_env) != pdPASS ){
+    if ( xTaskCreate(Env_eventloop,"env",256,nullptr,3,&task_handle_env) != pdPASS ){
         LOG_ERROR("Can't create task for env service.");
         return false;
     }

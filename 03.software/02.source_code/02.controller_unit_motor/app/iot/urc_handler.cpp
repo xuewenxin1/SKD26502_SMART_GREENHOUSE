@@ -29,7 +29,17 @@ UrcHandler::UrcResult MqttPublishUrcHandler::process_line(unsigned char *line_bu
             const char *str_payload_len = strtok(nullptr,",");
             const char *payload = strtok(nullptr,",");
             if ( payload != nullptr ){
-                strcpy(this->topic,str_topic);
+                const char *tp = str_topic;
+                while ( *tp == '"' || *tp == ' ' ){
+                    tp++;
+                }
+                strncpy(this->topic, tp, sizeof(this->topic) - 1);
+                this->topic[sizeof(this->topic) - 1] = 0;
+                unsigned int tlen = (unsigned int)strlen(this->topic);
+                while ( tlen > 0 && (this->topic[tlen - 1] == '"' || this->topic[tlen - 1] == ' ') ){
+                    this->topic[tlen - 1] = 0;
+                    tlen--;
+                }
                 unsigned int line_payload_length = length - (unsigned int)(payload - (const char*)line_buffer);
                 memcpy(this->buffer,payload,line_payload_length);
                 this->received_length = line_payload_length;

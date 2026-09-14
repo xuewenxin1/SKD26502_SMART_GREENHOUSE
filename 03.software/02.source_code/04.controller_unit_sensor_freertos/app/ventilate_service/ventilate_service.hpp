@@ -18,6 +18,7 @@ enum class Status {
 
 enum class ForceAction {
     None,
+    ForceStop,
     ForceOpen,
     ForceClose,
 };
@@ -32,7 +33,10 @@ bool calibrate();
 bool force(ForceAction force_action);
 bool on_mode_changed(void); /* 切换工作模式：保持当前开度，不强制归零. */
 bool set_opening_percentage(int value);
+bool set_target_turns(int turns);
 bool get_opening_percentage(int &value);
+/* 当前已走完的整数圈数；未满一圈为 0. */
+bool get_current_turns(int &turns);
 bool get_status(Status &status);
 
 bool get_motor_state(Motor::State &state);

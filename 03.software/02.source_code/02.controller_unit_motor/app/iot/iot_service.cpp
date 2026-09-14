@@ -30,8 +30,9 @@ unsigned int rx_length = 0;
 static const char *ATCMD_TEST = "AT\r\n";
 static const char *ATCMD_MCCID = "AT+MCCID\r\n";
 static const char *ATCMD_CGSN = "AT+GSN=1\r\n";
-static const char *ATCMD_MQTT_CONNECT = "AT+MQTTCONN=0,\"8.130.47.7\",1883,\"SmartGH\"\r\n";
-static const char *ATCMD_MQTT_DISCONN = "AT+MOTTDISC=0\r\n";
+static const char *ATCMD_CSQ = "AT+CSQ\r\n";
+static const char *ATCMD_MQTT_CONNECT_FMT = "AT+MQTTCONN=0,\"8.130.47.7\",1883,\"%s\"\r\n";
+static const char *ATCMD_MQTT_DISCONN = "AT+MQTTDISC=0\r\n";
 static const char *ATCMD_MQTT_PUBLISH = "AT+MQTTPUB=0,\"%s\",0,0,0,%d,\"%s\"\r\n";
 static const char *ATCMD_MQTT_SUB = "AT+MQTTSUB=0,\"%s\",0\r\n";
 
@@ -41,12 +42,8 @@ static void at_test(){
     HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_TEST,strlen(ATCMD_TEST),0xffff);
 }
 
-static void mqtt_conn(){
-    HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_MQTT_CONNECT,strlen(ATCMD_MQTT_CONNECT),0xffff);
-}
-
 static void mqtt_disconn(){
-    HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_MQTT_DISCONN,strlen(ATCMD_MQTT_CONNECT),0xffff);
+    HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_MQTT_DISCONN,strlen(ATCMD_MQTT_DISCONN),0xffff);
 }
 
 static bool IOTService_board_init(){
@@ -99,6 +96,18 @@ static char g_imei[16] = {0};
 
 static void message(const char *topic, const char *payload, unsigned int length){
     LOG_INFO("MQTT topic:%s msg(%d):%s",topic,length,payload);
+    if ( g_imei_flag ){
+        const char *t = topic;
+        if ( *t == '"' ){
+            t++;
+        }
+        char expect[40] = {0};
+        snprintf(expect, sizeof(expect), "greenhouse/%s/", g_imei);
+        if ( strncmp(t, expect, strlen(expect)) != 0 ){
+            LOG_WARN("Ignore foreign topic.");
+            return;
+        }
+    }
     char payload_buffer[32] = {0};
     unsigned char buffer[32] = {0};
 
@@ -238,8 +247,23 @@ static void IOTService_serv_init(){
             break;
         }
     }
-    /* 连接MQTT Broker. */
-    at->send(ATCMD_MQTT_CONNECT,strlen(ATCMD_MQTT_CONNECT));
+
+    if ( (g_imei_flag == false) || (g_mccid_flag == false) ){
+        LOG_ERROR("MQTT service init failed.");
+        return;
+    }
+
+    at->send(ATCMD_CSQ, strlen(ATCMD_CSQ));
+    SysTimer::delay(500);
+
+    at->send(ATCMD_MQTT_DISCONN, strlen(ATCMD_MQTT_DISCONN));
+    SysTimer::delay(1000);
+
+    char mqtt_conn_at[80] = {0};
+    unsigned int conn_len = (unsigned int)snprintf(mqtt_conn_at, sizeof(mqtt_conn_at),
+                                                   ATCMD_MQTT_CONNECT_FMT, g_imei);
+    LOG_INFO("MQTT connect client_id=%s", g_imei);
+    at->send(mqtt_conn_at, conn_len);
     cnt = 0;
     while ( true ){
         SysTimer::delay(100);
@@ -255,7 +279,7 @@ static void IOTService_serv_init(){
         }
     }
 
-    SysTimer::delay(2000);
+    SysTimer::delay(3000);
     if ( g_imei_flag && g_mccid_flag ){
         LOG_INFO("Subscribe topics.");
         char str_buffer[64] = {0};

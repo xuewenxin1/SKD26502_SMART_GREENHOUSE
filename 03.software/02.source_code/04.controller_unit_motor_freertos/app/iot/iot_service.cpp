@@ -27,31 +27,122 @@ static const uint8_t DEVICE_TYPE = 0x01;    /* 放风机 */
 
 static char at_buffer[256];
 static char mp_urc_buffer[256];
-static volatile uint8_t rx_ring[256];
-static volatile uint8_t rx_w = 0;
-static volatile uint8_t rx_r = 0;
+/* Flash 擦写期间任务挂起，115200 约 1ms≈11 字节；512 可撑约 45ms，兼顾 RAM. */
+#define RX_RING_SIZE 512
+#define RX_RING_MASK (RX_RING_SIZE - 1)
+static volatile uint8_t rx_ring[RX_RING_SIZE];
+static volatile uint16_t rx_w = 0;
+static volatile uint16_t rx_r = 0;
+static volatile uint8_t pending_up_status = 0;
+static volatile uint8_t pending_up_config = 0;
+
+/* 下行先入队，避免在 URC/drain 回调里嵌套处理 ACT 导致 IOT 栈溢出卡死. */
+enum {
+    DOWN_ACT = 1,
+    DOWN_CONFIG = 2,
+    DOWN_EXTRA = 3,
+};
+#define DOWN_Q_SIZE 2
+typedef struct {
+    unsigned char type;
+    unsigned char len;
+    unsigned char data[24];
+} DownItem_t;
+static DownItem_t down_q[DOWN_Q_SIZE];
+static volatile uint8_t down_w = 0;
+static volatile uint8_t down_r = 0;
+
+static unsigned char down_topic_type(const char *topic){
+    const char *p = topic;
+    if ( *p == '"' ){
+        p++;
+    }
+    /* .../down/act|config|extra */
+    const char *slash = p;
+    int segs = 0;
+    while ( *slash ){
+        if ( *slash == '/' ){
+            segs++;
+            if ( segs == 3 ){
+                slash++;
+                break;
+            }
+        }
+        slash++;
+    }
+    if ( segs < 3 ){
+        return 0;
+    }
+    if ( strncmp(slash, "act", 3) == 0 ){
+        return DOWN_ACT;
+    }
+    if ( strncmp(slash, "config", 6) == 0 ){
+        return DOWN_CONFIG;
+    }
+    if ( strncmp(slash, "extra", 5) == 0 ){
+        return DOWN_EXTRA;
+    }
+    return 0;
+}
+
+static bool down_enqueue(const char *topic, const unsigned char *data, unsigned int len){
+    unsigned char type = down_topic_type(topic);
+    if ( type == 0 ){
+        return false;
+    }
+    uint8_t next = (uint8_t)((down_w + 1) % DOWN_Q_SIZE);
+    if ( next == down_r ){
+        return false;
+    }
+    DownItem_t *item = &down_q[down_w];
+    item->type = type;
+    if ( len > sizeof(item->data) ){
+        len = sizeof(item->data);
+    }
+    for ( unsigned int i = 0; i < len; i++ ){
+        item->data[i] = data[i];
+    }
+    item->len = (unsigned char)len;
+    down_w = next;
+    return true;
+}
+
+static void down_process_pending(void){
+    while ( down_r != down_w ){
+        DownItem_t *item = &down_q[down_r];
+        if ( item->type == DOWN_ACT ){
+            process_iot_down("greenhouse/x/down/act", item->data, item->len);
+        }else if ( item->type == DOWN_CONFIG ){
+            process_iot_down("greenhouse/x/down/config", item->data, item->len);
+        }else if ( item->type == DOWN_EXTRA ){
+            process_iot_down("greenhouse/x/down/extra", item->data, item->len);
+        }
+        down_r = (uint8_t)((down_r + 1) % DOWN_Q_SIZE);
+    }
+}
 
 static const char *ATCMD_TEST = "AT\r\n";
 static const char *ATCMD_MCCID = "AT+MCCID\r\n";
 static const char *ATCMD_CGSN = "AT+GSN=1\r\n";
-static const char *ATCMD_MQTT_CONNECT = "AT+MQTTCONN=0,\"8.130.47.7\",1883,\"SmartGH\"\r\n";
-static const char *ATCMD_MQTT_DISCONN = "AT+MOTTDISC=0\r\n";
+static const char *ATCMD_CSQ = "AT+CSQ\r\n";
+/* Client ID 必须每台唯一；原固定 SmartGH 会导致多机互踢、串 topic、607. */
+static const char *ATCMD_MQTT_CONNECT_FMT = "AT+MQTTCONN=0,\"8.130.47.7\",1883,\"%s\"\r\n";
+static const char *ATCMD_MQTT_DISCONN = "AT+MQTTDISC=0\r\n";
 static const char *ATCMD_MQTT_PUBLISH = "AT+MQTTPUB=0,\"%s\",0,0,0,%d,\"%s\"\r\n";
 static const char *ATCMD_MQTT_SUB = "AT+MQTTSUB=0,\"%s\",0\r\n";
 
 static TaskHandle_t task_handle_iot = nullptr;
 static UART_HandleTypeDef huart_iot;
 
+static void IOTService_wait_ms(unsigned int ms);
+static void IOTService_drain_rx(void);
+
 static void at_test(){
     HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_TEST,strlen(ATCMD_TEST),0xffff);
 }
 
-static void mqtt_conn(){
-    HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_MQTT_CONNECT,strlen(ATCMD_MQTT_CONNECT),0xffff);
-}
-
 static void mqtt_disconn(){
-    HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_MQTT_DISCONN,strlen(ATCMD_MQTT_CONNECT),0xffff);
+    HAL_UART_Transmit(&huart_iot,(uint8_t*)ATCMD_MQTT_DISCONN,strlen(ATCMD_MQTT_DISCONN),0xffff);
 }
 
 static bool IOTService_board_init(){
@@ -104,29 +195,49 @@ static char g_imei[16] = {0};
 
 static void message(const char *topic, const char *payload, unsigned int length){
     LOG_INFO("MQTT topic:%s msg(%d):%s",topic,length,payload);
-    char payload_buffer[32] = {0};
-    unsigned char buffer[32] = {0};
+    /* topic 来自 URC，可能带引号："greenhouse/<IMEI>/..." */
+    if ( g_imei_flag ){
+        const char *t = topic;
+        if ( *t == '"' ){
+            t++;
+        }
+        char expect[40] = {0};
+        snprintf(expect, sizeof(expect), "greenhouse/%s/", g_imei);
+        if ( strncmp(t, expect, strlen(expect)) != 0 ){
+            LOG_WARN("Ignore foreign topic.");
+            return;
+        }
+    }
+    /* 新 config 包 23 字节 → Base64 正好 32 字符；缓冲需大于 32. */
+    char payload_buffer[64] = {0};
+    unsigned char buffer[64] = {0};
 
     ChecksumCalculator checksum_calculator;
-    if ( length < 32 ){
-        strcpy(payload_buffer,payload);
-        for ( int n = 0; n < 32; n++ ){
-            if ( payload_buffer[n] == '\r' || payload_buffer[n] == '\n' ){
-                payload_buffer[n] = 0;
-                length = strlen(payload_buffer);
-                break;
-            }
+    if ( length >= sizeof(payload_buffer) ){
+        LOG_WARN("MQTT payload too long %u.", length);
+        return;
+    }
+    memcpy(payload_buffer, payload, length);
+    payload_buffer[length] = 0;
+    for ( unsigned int n = 0; n < length; n++ ){
+        if ( payload_buffer[n] == '\r' || payload_buffer[n] == '\n' ){
+            payload_buffer[n] = 0;
+            length = (unsigned int)strlen(payload_buffer);
+            break;
         }
-        int len = base64_decode(buffer,(uint8_t*)payload_buffer,length);
-        if ( len > 0 ){
-            checksum_calculator.start();
-            checksum_calculator.feed(buffer,len - 1);
-            unsigned char f_checksum = checksum_calculator.get();
-            if ( f_checksum == buffer[len - 1] ){
-                /* 校验通过. */
-                LOG_INFO("Decoded payload len:%d",len);
-                process_iot_down(topic,buffer,len);
+    }
+    int len = base64_decode(buffer,(uint8_t*)payload_buffer,length);
+    if ( len > 0 ){
+        checksum_calculator.start();
+        checksum_calculator.feed(buffer,len - 1);
+        unsigned char f_checksum = checksum_calculator.get();
+        if ( f_checksum == buffer[len - 1] ){
+            LOG_INFO("Decoded payload len:%d",len);
+            if ( down_enqueue(topic, buffer, (unsigned int)len) == false ){
+                LOG_WARN("MQTT down queue full, drop.");
             }
+        }else{
+            LOG_WARN("MQTT checksum fail, len %d.", len);
         }
     }
 }
@@ -153,7 +264,8 @@ static void mqtt_publish(char *topic,char *message,int length){
         return;
     }
     unsigned int len = snprintf(publish_at_buffer,255,ATCMD_MQTT_PUBLISH,topic,length,message);
-    LOG_DEBUG("S:%s",publish_at_buffer);
+    /* 勿每次打印整包 AT，串口日志过长会堵任务、加重卡死. */
+    LOG_DEBUG("MQTTPUB %s len=%d", topic, length);
     if ( at != nullptr ){
         at->send(publish_at_buffer,len);
     }
@@ -165,12 +277,25 @@ static void mqtt_publish_base64(char *topic,const unsigned char *data, int lengt
     mqtt_publish(topic,base64_buffer,len);
 }
 
-static void mqtt_subscribe(char *topic) {
+static bool mqtt_subscribe_ok(char *topic) {
     static char subscribe_at_buffer[256] = {0};
     unsigned int len = snprintf(subscribe_at_buffer,255,ATCMD_MQTT_SUB,topic);
-    if ( at != nullptr ){
-        at->send(subscribe_at_buffer,len);
+    if ( at == nullptr ){
+        return false;
     }
+    for ( int try_n = 0; try_n < 3; try_n++ ){
+        at->send(subscribe_at_buffer,len);
+        for ( int n = 0; n < 20; n++ ){
+            IOTService_wait_ms(100);
+            if ( at->get_command_return() == AT::CommandReturn::Ok ){
+                LOG_INFO("MQTT SUB OK: %s", topic);
+                return true;
+            }
+        }
+        LOG_WARN("MQTT SUB retry %d: %s", try_n + 1, topic);
+    }
+    LOG_ERROR("MQTT SUB failed: %s", topic);
+    return false;
 }
 
 static void send_callback(const char *buffer, unsigned int length){
@@ -207,9 +332,9 @@ static void IOTService_drain_rx(void){
         return;
     }
     while ( rx_r != rx_w ){
-        uint8_t r = rx_r;
+        uint16_t r = rx_r;
         uint8_t byte = rx_ring[r];
-        rx_r = (uint8_t)(r + 1);
+        rx_r = (uint16_t)((r + 1) & RX_RING_MASK);
         at->feed_byte(byte);
     }
 }
@@ -222,9 +347,11 @@ static void IOTService_wait_ms(unsigned int ms){
     }
     while ( (xTaskGetTickCount() - start) < wait ){
         IOTService_drain_rx();
-        vTaskDelay(pdMS_TO_TICKS(5));
+        down_process_pending();
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
     IOTService_drain_rx();
+    down_process_pending();
 }
 
 static bool IOTService_serv_init(){
@@ -274,12 +401,31 @@ static bool IOTService_serv_init(){
         }
     }
 
-    at->send(ATCMD_MQTT_CONNECT,strlen(ATCMD_MQTT_CONNECT));
+    if ( (g_imei_flag == false) || (g_mccid_flag == false) ){
+        LOG_ERROR("MQTT service init failed.");
+        return false;
+    }
+
+    /* 查询信号，便于现场对照日志. */
+    at->send(ATCMD_CSQ, strlen(ATCMD_CSQ));
+    IOTService_wait_ms(500);
+
+    /* 先断开，避免半连接/607 状态错. */
+    at->send(ATCMD_MQTT_DISCONN, strlen(ATCMD_MQTT_DISCONN));
+    IOTService_wait_ms(1000);
+
+    char mqtt_conn_at[80] = {0};
+    unsigned int conn_len = (unsigned int)snprintf(mqtt_conn_at, sizeof(mqtt_conn_at),
+                                                   ATCMD_MQTT_CONNECT_FMT, g_imei);
+    LOG_INFO("MQTT connect client_id=%s", g_imei);
+    at->send(mqtt_conn_at, conn_len);
     cnt = 0;
+    bool mqtt_ok = false;
     while ( true ){
         IOTService_wait_ms(100);
         if ( at->get_command_return() == AT::CommandReturn::Ok ){
             LOG_INFO("MQTT connect OK.");
+            mqtt_ok = true;
             break;
         }
         if ( cnt < 50 ){
@@ -289,24 +435,31 @@ static bool IOTService_serv_init(){
             break;
         }
     }
-
-    IOTService_wait_ms(2000);
-    if ( (g_imei_flag == false) || (g_mccid_flag == false) ){
-        LOG_ERROR("MQTT service init failed.");
+    if ( mqtt_ok == false ){
         return false;
     }
+    /* 等 URC conn,0,0 稳定后再订. */
+    IOTService_wait_ms(3000);
 
     LOG_INFO("Subscribe topics.");
     char str_buffer[64] = {0};
+    bool sub_ok = true;
     snprintf(str_buffer,63,"greenhouse/%s/down/act",g_imei);
-    mqtt_subscribe(str_buffer);
-    IOTService_wait_ms(200);
+    if ( mqtt_subscribe_ok(str_buffer) == false ){
+        sub_ok = false;
+    }
     snprintf(str_buffer,63,"greenhouse/%s/down/config",g_imei);
-    mqtt_subscribe(str_buffer);
-    IOTService_wait_ms(200);
+    if ( mqtt_subscribe_ok(str_buffer) == false ){
+        sub_ok = false;
+    }
     snprintf(str_buffer,63,"greenhouse/%s/down/extra",g_imei);
-    mqtt_subscribe(str_buffer);
-    IOTService_wait_ms(200);
+    if ( mqtt_subscribe_ok(str_buffer) == false ){
+        sub_ok = false;
+    }
+    if ( sub_ok == false ){
+        LOG_ERROR("MQTT subscribe incomplete.");
+        return false;
+    }
     LOG_INFO("MQTT service init OK.");
     return true;
 }
@@ -343,6 +496,18 @@ void IOTService_up_status(){
     Env::get_humidity(f_humi);
     VentilateService::get_opening_percentage(opening_percentage);
 
+    Config_t cfg;
+    ConfigService::get_config(cfg);
+    /* 当前整数圈数（未满 1 圈为 0）；例：走完 1 圈才显示 1. */
+    int current_turns = 0;
+    VentilateService::get_current_turns(current_turns);
+    if ( current_turns < 0 ){
+        current_turns = 0;
+    }
+    if ( current_turns > 65535 ){
+        current_turns = 65535;
+    }
+
     int16_t i16_temp = static_cast<int16_t>(f_temp * 10.0);
     int16_t i16_humi = static_cast<int16_t>(f_humi * 10.0);
     uint8_t fault_code = 0; /* 无故障 / 故障消失：固定报 0. */
@@ -372,7 +537,6 @@ void IOTService_up_status(){
         }
     }
     
-    opening_percentage = opening_percentage * 10;
     ChecksumCalculator checksum_calculator;
 
     snprintf(topic,63,"greenhouse/%s/up/status",g_imei);
@@ -381,8 +545,8 @@ void IOTService_up_status(){
     buffer[1] = (i16_temp >> 8) & 0xff;
     buffer[2] = (i16_humi & 0xff);
     buffer[3] = (i16_humi >> 8) & 0xff;
-    buffer[4] = opening_percentage & 0xff;
-    buffer[5] = (opening_percentage >> 8) & 0xff;
+    buffer[4] = current_turns & 0xff;
+    buffer[5] = (current_turns >> 8) & 0xff;
     buffer[6] = motor_running_state;
     buffer[7] = fault_code;
     unsigned int battery_percent = 0;
@@ -398,7 +562,8 @@ void IOTService_up_status(){
     buffer[9] = checksum_calculator.get();
 
     mqtt_publish_base64(topic,(unsigned char*)buffer,10);
-    LOG_INFO("Report opening %d percent, fault %u.", opening_percentage / 10, (unsigned int)fault_code);
+    LOG_INFO("Report turns %d (%d%% of %d), fault %u.",
+             current_turns, opening_percentage, cfg.motor_stroke_time, (unsigned int)fault_code);
 }
 
 void IOTService_up_config(){
@@ -422,14 +587,32 @@ void IOTService_up_config(){
     payload[11] = (uint8_t)(config.temp_compensation_value & 0xff);
     payload[12] = (uint8_t)((config.temp_compensation_value >> 8) & 0xff);
     payload[13] = (uint8_t)(config.device_valid);
+    payload[14] = (uint8_t)(config.motor_stroke_time & 0xff);
+    payload[15] = (uint8_t)((config.motor_stroke_time >> 8) & 0xff);
+    payload[16] = (uint8_t)(config.motor_turn_seconds & 0xff);
+    payload[17] = (uint8_t)((config.motor_turn_seconds >> 8) & 0xff);
+    payload[18] = (uint8_t)(config.temp_vent_upper_limit & 0xff);
+    payload[19] = (uint8_t)((config.temp_vent_upper_limit >> 8) & 0xff);
+    payload[20] = (uint8_t)(config.temp_vent_lower_limit & 0xff);
+    payload[21] = (uint8_t)((config.temp_vent_lower_limit >> 8) & 0xff);
+    /* 温度校准：与 P4 温度补偿相同，协议×10（有符号，如 -20=-2.0℃）. */
+    payload[22] = (uint8_t)(config.temp_compensation_value & 0xff);
+    payload[23] = (uint8_t)((config.temp_compensation_value >> 8) & 0xff);
     checksum_calculator.start();
-    checksum_calculator.feed(payload,14);
-    payload[14] = checksum_calculator.get();
-
+    checksum_calculator.feed(payload,24);
+    payload[24] = checksum_calculator.get();
 
     snprintf(topic,63,"greenhouse/%s/up/config",g_imei);
 
-    mqtt_publish_base64(topic,(unsigned char*)payload,15);
+    mqtt_publish_base64(topic,(unsigned char*)payload,25);
+}
+
+void IOTService_request_up_status(){
+    pending_up_status = 1;
+}
+
+void IOTService_request_up_config(){
+    pending_up_config = 1;
 }
 
 static void message_loop(){
@@ -516,6 +699,27 @@ void IOTService::eventloop(){
     static unsigned char retry_wait = 0;
     static unsigned char net_ok = 0;
 
+    IOTService_drain_rx();
+    down_process_pending();
+    /* 联网成功后再擦 Flash。开机/AT 阶段落盘会丢模组串口，导致 APP 连不上. */
+    if ( net_ok != 0 ){
+        if ( ConfigService::flush_store() ){
+            IOTService_drain_rx();
+            down_process_pending();
+            LOG_INFO("Config flash flushed.");
+        }
+    }
+    if ( pending_up_status != 0 ){
+        pending_up_status = 0;
+        IOTService_up_status();
+        IOTService_wait_ms(50);
+    }
+    if ( pending_up_config != 0 ){
+        pending_up_config = 0;
+        IOTService_up_config();
+        IOTService_wait_ms(50);
+    }
+
     if ( boot_wait < 10 ){
         boot_wait++;
         return;
@@ -555,7 +759,7 @@ static void IOTService_task(void *param){
 }
 
 bool IOTService::start(){
-    if ( xTaskCreate(IOTService_task,"iot",384,nullptr,10,&task_handle_iot) != pdPASS ){
+    if ( xTaskCreate(IOTService_task,"iot",384,nullptr,5,&task_handle_iot) != pdPASS ){
         LOG_ERROR("IOT task start failed.");
         return false;
     }
@@ -565,7 +769,7 @@ bool IOTService::start(){
 extern "C"
 void USART2_IRQHandler(void){
     uint8_t temp = (uint8_t)huart_iot.Instance->DR;
-    uint8_t next = (uint8_t)(rx_w + 1);
+    uint16_t next = (uint16_t)((rx_w + 1) & RX_RING_MASK);
     if ( next != rx_r ){
         rx_ring[rx_w] = temp;
         rx_w = next;

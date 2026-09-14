@@ -1,0 +1,20 @@
+================================================
+  烧录包（整夹拷走就能用）
+================================================
+
+本文件夹里的文件：
+
+  SKD26502_motor.bin     放风机固件（带 motor 标识）
+  SKD26502_sensor.bin    温湿度计固件（带 sensor 标识）
+  flash_motor.bat        烧放风机
+  flash_sensor.bat       烧温湿度计
+  setup_flash_env.bat    第一次用：装便携 Python + pyocd
+  sync_bins_from_build.bat  从工程重新拷贝最新 bin（开发用）
+
+用法：
+  1. 第一次双击 setup_flash_env.bat（要联网）
+  2. 插 ST-Link，板子上电
+  3. 双击 flash_motor.bat 或 flash_sensor.bat
+
+可以把整个「烧录包」文件夹拷到 U 盘 / 别的电脑使用。
+================================================

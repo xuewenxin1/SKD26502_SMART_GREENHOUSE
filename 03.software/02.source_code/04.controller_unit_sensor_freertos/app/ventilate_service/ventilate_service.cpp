@@ -17,13 +17,18 @@ static int32_t calibrate_value = 0;
 static bool align_stay_closed = false;
 static bool restore_saved_opening = false;
 static int persisted_opening = -1;
+static int persisted_timer_sec = -1;
 static int pending_persist_opening = -1;
 static unsigned int persist_idle_loops = 0;
+/* 主循环约 100ms，停稳 1s 再写 Flash；计时只按整秒存. */
+static const unsigned int PERSIST_IDLE_LOOPS = 10;
 static unsigned int align_loop_cnt = 0;
 static unsigned int align_budget_loops = 300;
 static unsigned int align_zero_curr_cnt = 0;
 static bool align_wait_zero = false;
 static bool end_stop_latched = false;
+/* 真正反转过之后才允许“关到位瞬间清零”；刚下发 0% 时不能清计时. */
+static bool close_run_latched = false;
 static bool auto_hold_pending = false;
 static int auto_hold_baseline = -1;
 static TaskHandle_t task_handle_ventilate = nullptr;
@@ -80,25 +85,26 @@ static int opening_to_int(double opening){
     return value;
 }
 
-/* 自动模式：只算整数℃，小数直接丢掉不四舍五入。温差 0+X℃→0%，每高 1℃ 开 10%，≥10+X℃ 开 100%。 */
-static int opening_from_temp_delta(double measured, double target, double hyst){
+/* 自动模式上下限回差(P6 下限 / P5 上限)，只算整数℃：
+ * ≥上限 → 全开；≤下限 → 全关；
+ * 上下限之间保持当前开/关（升温未到上限不开，降温未到下限不关）. */
+static int opening_from_temp_limits(double measured, double lower, double upper, int current_opening){
     int meas = (int)measured;
-    int tgt = (int)target;
-    int x = (int)hyst;
-    if ( x < 0 ){
-        x = 0;
+    int lo = (int)lower;
+    int hi = (int)upper;
+    if ( hi < lo ){
+        int tmp = hi;
+        hi = lo;
+        lo = tmp;
     }
-    if ( x > 5 ){
-        x = 5;
-    }
-    int effective = meas - tgt - x;
-    if ( effective <= 0 ){
-        return 0;
-    }
-    if ( effective >= 10 ){
+    if ( meas >= hi ){
         return 100;
     }
-    return effective * 10;
+    if ( meas <= lo ){
+        return 0;
+    }
+    /* lo < meas < hi：保持当前开度（含 App 下发的中间开度），不强制 0/100. */
+    return current_opening;
 }
 
 static void abort_opening_persist(void){
@@ -111,7 +117,8 @@ static void try_persist_stopped_opening(void){
         abort_opening_persist();
         return;
     }
-    if ( force_action != VentilateService::ForceAction::None ){
+    if ( (force_action != VentilateService::ForceAction::None)
+         && (force_action != VentilateService::ForceAction::ForceStop) ){
         abort_opening_persist();
         return;
     }
@@ -130,7 +137,16 @@ static void try_persist_stopped_opening(void){
         return;
     }
     int value = opening_to_int(opening_percentage_curr);
-    if ( value == persisted_opening ){
+    int64_t timer_cnt = 0;
+    motor->get_timer_cnt(timer_cnt);
+    if ( timer_cnt < 0 ){
+        timer_cnt = 0;
+    }
+    int timer_sec = (int)(timer_cnt / 1000LL);
+    if ( timer_sec > 2000000 ){
+        timer_sec = 2000000;
+    }
+    if ( (value == persisted_opening) && (timer_sec == persisted_timer_sec) ){
         abort_opening_persist();
         return;
     }
@@ -139,18 +155,21 @@ static void try_persist_stopped_opening(void){
         persist_idle_loops = 0;
     }
     persist_idle_loops++;
-    if ( persist_idle_loops < 5 ){
+    if ( persist_idle_loops < PERSIST_IDLE_LOOPS ){
         return;
     }
     persist_idle_loops = 0;
     Config_t saved;
     ConfigService::get_config(saved);
     saved.last_opening_percentage = value;
+    saved.last_motor_timer_cnt = timer_sec * 1000;
     ConfigService::set_config(saved);
-    ConfigService::store();
+    ConfigService::request_store();
     persisted_opening = value;
+    persisted_timer_sec = timer_sec;
     pending_persist_opening = -1;
-    LOG_INFO("Save opening %d percent after motor stop.", value);
+    LOG_INFO("Save opening %d percent, timer %d s after motor stop.",
+             value, timer_sec);
 }
 
 static double clamp_opening(double value){
@@ -163,29 +182,35 @@ static double clamp_opening(double value){
     return value;
 }
 
-static double calc_opening_percent(int64_t motor_timer_cnt, int stroke_time){
-    double stroke = (double)stroke_time;
-    if ( stroke < (double)MOTOR_STROKE_TIME_MIN ){
-        stroke = (double)MOTOR_STROKE_TIME_MIN;
+/* C1 圈数 × C2 秒/圈 = 满行程秒数. */
+static int stroke_seconds(int stroke_turns, int turn_seconds){
+    int turns = stroke_turns;
+    int sec = turn_seconds;
+    if ( turns < MOTOR_STROKE_TURNS_MIN ){
+        turns = MOTOR_STROKE_TURNS_MIN;
+    }else if ( turns > MOTOR_STROKE_TURNS_MAX ){
+        turns = MOTOR_STROKE_TURNS_MAX;
     }
+    if ( (sec < MOTOR_TURN_SECONDS_MIN) || (sec > MOTOR_TURN_SECONDS_MAX) ){
+        sec = MOTOR_TURN_SECONDS_DEFAULT;
+    }
+    return turns * sec;
+}
+
+static double calc_opening_percent(int64_t motor_timer_cnt, int stroke_turns, int turn_seconds){
+    double stroke = (double)stroke_seconds(stroke_turns, turn_seconds);
     return ((double)motor_timer_cnt / 10.0) / stroke;
 }
 
-static int stroke_seconds(int stroke_time){
-    if ( stroke_time < MOTOR_STROKE_TIME_MIN ){
-        return MOTOR_STROKE_TIME_MIN;
-    }
-    return stroke_time;
-}
-
-static void hold_opening(double opening, int stroke_time){
+static void hold_opening(double opening, int stroke_turns, int turn_seconds){
     opening = clamp_opening(opening);
     motor->execute_action(Motor::Action::STOP);
     if ( opening <= 0.0 ){
         motor->reset_timer();
         opening_percentage_curr = 0.0;
+        close_run_latched = false;
     }else{
-        int stroke = stroke_seconds(stroke_time);
+        int stroke = stroke_seconds(stroke_turns, turn_seconds);
         int64_t cnt = (int64_t)(opening * 10.0 * (double)stroke + 0.5);
         motor->set_timer_cnt(cnt);
         opening_percentage_curr = opening;
@@ -213,6 +238,12 @@ static void drive(Motor::Action action){
     if ( (action == Motor::Action::STOP) && (state == Motor::State::IDLE) ){
         return;
     }
+    if ( action == Motor::Action::FORWARD ){
+        close_run_latched = false;
+    }else if ( (action == Motor::Action::REVERSE)
+               && (opening_percentage_set <= 0.5) ){
+        close_run_latched = true;
+    }
     motor->execute_action(action);
 }
 
@@ -234,7 +265,7 @@ static void stop_at_travel_limits(const Config_t &config){
     Motor::State state = Motor::State::IDLE;
     motor->get_timer_cnt(cnt);
     motor->get_state(state);
-    const int shown = opening_to_int(calc_opening_percent(cnt, config.motor_stroke_time));
+    const int shown = opening_to_int(calc_opening_percent(cnt, config.motor_stroke_time, config.motor_turn_seconds));
     const bool force_open = (force_action == VentilateService::ForceAction::ForceOpen);
     const bool opening_now = (state == Motor::State::RUNNING_FORWARD)
         || force_open
@@ -243,7 +274,7 @@ static void stop_at_travel_limits(const Config_t &config){
         if ( (force_open == false) && (state != Motor::State::RUNNING_FORWARD)
              && (opening_percentage_set <= 0.5) ){
             const bool first_cut = (end_stop_latched == false) || (state != Motor::State::IDLE);
-            hold_opening(0.0, config.motor_stroke_time);
+            hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
             force_action = VentilateService::ForceAction::None;
             motor->set_ignore_stall(false);
             end_stop_latched = true;
@@ -255,18 +286,20 @@ static void stop_at_travel_limits(const Config_t &config){
     }
     const bool closing = (force_action == VentilateService::ForceAction::ForceClose)
         || (ventilate_service_status == VentilateService::Status::ALIGN)
-        || ((opening_percentage_set <= 0.5) && (opening_now == false));
+        || close_run_latched
+        || ((opening_percentage_set <= 0.5) && (opening_now == false)
+            && (state == Motor::State::RUNNING_REVERSE));
     const bool aligning = (ventilate_service_status == VentilateService::Status::ALIGN);
     const bool idle = (state == Motor::State::IDLE);
     if ( EndStopPolicy::should_stop_close(force_open, closing, aligning, align_loop_cnt, idle, shown, opening_now) ){
-        hold_opening(0.0, config.motor_stroke_time);
+        hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
         force_action = VentilateService::ForceAction::None;
         motor->set_ignore_stall(false);
         end_stop_latched = true;
         LOG_INFO("Stop at 0 percent.");
     }else if ( (state == Motor::State::RUNNING_FORWARD) && (shown >= 100) ){
         if ( force_action != VentilateService::ForceAction::ForceClose ){
-            hold_opening(100.0, config.motor_stroke_time);
+            hold_opening(100.0, config.motor_stroke_time, config.motor_turn_seconds);
             force_action = VentilateService::ForceAction::None;
             motor->set_ignore_stall(false);
             end_stop_latched = true;
@@ -275,7 +308,7 @@ static void stop_at_travel_limits(const Config_t &config){
     }
 }
 
-static bool try_snap_end_stop(Motor::State state, double current, int stroke_time){
+static bool try_snap_end_stop(Motor::State state, double current, int stroke_turns, int turn_seconds){
     if ( end_stop_latched ){
         if ( (opening_percentage_set > 0.5)
              || (state == Motor::State::RUNNING_FORWARD)
@@ -301,13 +334,13 @@ static bool try_snap_end_stop(Motor::State state, double current, int stroke_tim
         return false;
     }
     if ( (opening_percentage_set >= 100.0) && (opening_percentage_curr >= 90.0) ){
-        hold_opening(100.0, stroke_time);
+        hold_opening(100.0, stroke_turns, turn_seconds);
         end_stop_latched = true;
         LOG_INFO("End stop, set 100 percent.");
         return true;
     }
     if ( (opening_percentage_set <= 0.0) && (opening_percentage_curr <= 10.0) ){
-        hold_opening(0.0, stroke_time);
+        hold_opening(0.0, stroke_turns, turn_seconds);
         end_stop_latched = true;
         LOG_INFO("End stop, set 0 percent.");
         return true;
@@ -319,7 +352,7 @@ static void stop_force_and_hold(double opening){
     Config_t cfg;
     ConfigService::get_config(cfg);
     motor->set_ignore_stall(false);
-    hold_opening(opening, cfg.motor_stroke_time);
+    hold_opening(opening, cfg.motor_stroke_time, cfg.motor_turn_seconds);
     force_action = VentilateService::ForceAction::None;
     LOG_INFO("Force stop at %d percent.", (int)opening_percentage_curr);
 }
@@ -335,9 +368,45 @@ bool VentilateService::init(){
     {
         Config_t boot_config;
         ConfigService::get_config(boot_config);
-        persisted_opening = opening_to_int((double)boot_config.last_opening_percentage);
+        int saved = boot_config.last_opening_percentage;
+        if ( saved < 0 ){
+            saved = 0;
+        }
+        if ( saved > 100 ){
+            saved = 100;
+        }
+        persisted_opening = saved;
+        persisted_timer_sec = boot_config.last_motor_timer_cnt / 1000;
+        if ( persisted_timer_sec < 0 ){
+            persisted_timer_sec = 0;
+        }
+        /* 上电不主动转、不归零：恢复上次停稳的行程计时与开度，电机保持不动. */
+        end_stop_latched = false;
+        restore_saved_opening = false;
+        align_stay_closed = false;
+        motor->set_home_seek(false);
+        motor->execute_action(Motor::Action::STOP);
+        int64_t cnt = (int64_t)boot_config.last_motor_timer_cnt;
+        if ( cnt < 0 ){
+            cnt = 0;
+        }
+        motor->set_timer_cnt(cnt);
+        double opening = clamp_opening(calc_opening_percent(cnt, boot_config.motor_stroke_time, boot_config.motor_turn_seconds));
+        opening_percentage_curr = opening;
+        opening_percentage_set = opening;
+        if ( (opening_to_int(opening) <= 0) || (opening_to_int(opening) >= 100) ){
+            end_stop_latched = true;
+        }
+        auto_hold_pending = true;
+        auto_hold_baseline = -1;
+        ventilate_service_status = Status::STOPPED;
+        int turns_now = 0;
+        if ( boot_config.motor_stroke_time > 0 ){
+            turns_now = (opening_to_int(opening) * boot_config.motor_stroke_time) / 100;
+        }
+        LOG_INFO("Boot keep timer %d (0.1s), opening %d percent, turns %d, no move.",
+                 (int)cnt, opening_to_int(opening), turns_now);
     }
-    VentilateService::align();
     return true;
 }
 
@@ -357,7 +426,7 @@ bool VentilateService::align(){
     align_stay_closed = false;
     restore_saved_opening = (saved > 0);
     ventilate_service_status = Status::ALIGN;
-    int stroke = stroke_seconds(config.motor_stroke_time);
+    int stroke = stroke_seconds(config.motor_stroke_time, config.motor_turn_seconds);
     /* 超时只作安全上限：必须关到机械限位。完成仍看电流 0 且电机已停. */
     align_budget_loops = 10U * (unsigned int)stroke + 80U;
     if ( align_budget_loops < 80U ){
@@ -385,7 +454,7 @@ bool VentilateService::home_after_stroke_change(){
     restore_saved_opening = false;
     align_stay_closed = true;
     ventilate_service_status = Status::ALIGN;
-    int stroke = stroke_seconds(config.motor_stroke_time);
+    int stroke = stroke_seconds(config.motor_stroke_time, config.motor_turn_seconds);
     align_budget_loops = 10U * (unsigned int)stroke + 50U;
     motor->set_home_seek(true);
     motor->execute_action(Motor::Action::REVERSE);
@@ -464,6 +533,7 @@ void VentilateService::eventloop(){
             }
         }else if ( ventilate_service_status == VentilateService::Status::CALIBRATING_STAGE1 ){
             /* 等待电机停止进入Stage2. */
+
             Motor::State state = Motor::State::IDLE;
             motor->get_state(state);
             if ( state == Motor::State::IDLE ){
@@ -510,17 +580,26 @@ void VentilateService::eventloop(){
                 motor->set_calibrating(false);
                 motor->reset_timer();
                 motor->execute_action(Motor::Action::STOP);
-                /* 往返计时单位约 1ms，有效行程 = (T1+T2)/2 秒. */
-                unsigned int time = calibrate_value / 2000;
-                if ( time < MOTOR_STROKE_TIME_MIN ){
-                    time = MOTOR_STROKE_TIME_MIN;
-                }else if ( time > MOTOR_STROKE_TIME_MAX ){
-                    time = MOTOR_STROKE_TIME_MAX;
+                /* 往返计时单位约 1ms，有效行程秒 = (T1+T2)/2，再按 C2 秒/圈换算圈数. */
+                unsigned int time_sec = calibrate_value / 2000;
+                Config_t cal_cfg;
+                ConfigService::get_config(cal_cfg);
+                unsigned int sec_per = (unsigned int)cal_cfg.motor_turn_seconds;
+                if ( (sec_per < (unsigned int)MOTOR_TURN_SECONDS_MIN)
+                     || (sec_per > (unsigned int)MOTOR_TURN_SECONDS_MAX) ){
+                    sec_per = (unsigned int)MOTOR_TURN_SECONDS_DEFAULT;
+                }
+                unsigned int turns = (time_sec + sec_per / 2U) / sec_per;
+                if ( turns < (unsigned int)MOTOR_STROKE_TURNS_MIN ){
+                    turns = (unsigned int)MOTOR_STROKE_TURNS_MIN;
+                }else if ( turns > (unsigned int)MOTOR_STROKE_TURNS_MAX ){
+                    turns = (unsigned int)MOTOR_STROKE_TURNS_MAX;
                 }
                 Config_t saved_config;
                 ConfigService::get_config(saved_config);
-                LOG_DEBUG("Stage 3 cnt %d, (%d) Save new motor stroke time %d.", (int)motor_timer_cnt, (int)calibrate_value, (int)time);
-                saved_config.motor_stroke_time = (int)time;
+                LOG_INFO("Calibrate done, stroke %u turns (%u sec).", turns, time_sec);
+                LOG_DEBUG("Stage 3 cnt %d, (%d) Save new motor stroke turns %u.", (int)motor_timer_cnt, (int)calibrate_value, turns);
+                saved_config.motor_stroke_time = (int)turns;
                 ConfigService::set_config(saved_config);
                 ConfigService::store();
                 /* 校准结束电机已在 0 位，按新行程重新计算开度. */
@@ -539,27 +618,38 @@ void VentilateService::eventloop(){
             motor->get_timer_cnt(motor_timer_cnt);
             motor->get_state(motor_state);
             motor->get_current(current);
-            opening_percentage_curr = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time));
+            opening_percentage_curr = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds));
             opening_percentage_set = clamp_opening(opening_percentage_set);
-            if ( try_snap_end_stop(motor_state, current, config.motor_stroke_time) ){
+            if ( try_snap_end_stop(motor_state, current, config.motor_stroke_time, config.motor_turn_seconds) ){
                 /* 停稳后再记忆开度. */
             }else if ( opening_percentage_set >= 100.0 ){
                 if ( opening_to_int(opening_percentage_curr) >= 100 ){
-                    hold_opening(100.0, config.motor_stroke_time);
+                    hold_opening(100.0, config.motor_stroke_time, config.motor_turn_seconds);
                 }else{
                     drive(Motor::Action::FORWARD);
                 }
             }else if ( opening_percentage_set <= 0.0 ){
                 if ( opening_to_int(opening_percentage_curr) <= 0 ){
-                    hold_opening(0.0, config.motor_stroke_time);
+                    hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
                 }else{
                     drive(Motor::Action::REVERSE);
                 }
             }else{
+                int stroke_turns = config.motor_stroke_time;
+                if ( stroke_turns < MOTOR_STROKE_TURNS_MIN ){
+                    stroke_turns = MOTOR_STROKE_TURNS_MIN;
+                }
+                double deadband = 10.0 / (double)stroke_turns;
+                if ( deadband < 0.05 ){
+                    deadband = 0.05;
+                }
+                if ( deadband > 0.5 ){
+                    deadband = 0.5;
+                }
                 double delta_percentage = opening_percentage_curr - opening_percentage_set;
-                if ( delta_percentage > 0.5 ){
+                if ( delta_percentage > deadband ){
                     drive(Motor::Action::REVERSE);
-                }else if ( delta_percentage < -0.5 ){
+                }else if ( delta_percentage < -deadband ){
                     drive(Motor::Action::FORWARD);
                 }else{
                     drive(Motor::Action::STOP);
@@ -573,7 +663,7 @@ void VentilateService::eventloop(){
         motor->get_timer_cnt(motor_timer_cnt);
         motor->get_state(motor_state);
         motor->get_current(current);
-        double opening = calc_opening_percent(motor_timer_cnt, config.motor_stroke_time);
+        double opening = calc_opening_percent(motor_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds);
         opening_percentage_curr = clamp_opening(opening);
         if ( force_action == VentilateService::ForceAction::ForceOpen ){
             opening_percentage_set = 100.0;
@@ -617,26 +707,37 @@ void VentilateService::eventloop(){
         }
     }
 
-    /* 自动模式：实测高于目标越多，开度越大.
-     * 刚切换到自动时先保持当前开度，等温差算出的目标相对切入时变化后再跟调，避免一切换就被打到 0%. */
+    /* 自动模式：P6 下限关、P5 上限开，中间保持原状.
+     * 上电/切模式：先记录温控基线，基线不变时不改开度，避免上电立刻转动. */
     if ( (config.working_mode == WorkingMode_Auto)
          && (force_action == VentilateService::ForceAction::None)
          && (ventilate_service_status != VentilateService::Status::ALIGN)
          && (in_calibrating() == false) ){
         double temp_curr = 0.0;
         if ( Env::get_temperature(temp_curr) == true ){
-            double target = (double)config.target_central_temp / 10.0;
-            double hyst = (double)config.temp_return_diff_positive / 10.0;
-            int auto_opening = opening_from_temp_delta(temp_curr, target, hyst);
+            double lower = (double)config.temp_vent_lower_limit / 10.0;
+            double upper = (double)config.temp_vent_upper_limit / 10.0;
+            int current = opening_to_int(opening_percentage_set);
+            int auto_opening = opening_from_temp_limits(temp_curr, lower, upper, current);
             if ( auto_hold_pending ){
-                auto_hold_baseline = auto_opening;
                 auto_hold_pending = false;
+                auto_hold_baseline = auto_opening;
+                LOG_INFO("Auto hold keep opening %d percent (baseline %d).",
+                         current, auto_opening);
+            }else if ( auto_hold_baseline < 0 ){
+                auto_hold_baseline = auto_opening;
+                if ( current != auto_opening ){
+                    LOG_INFO("Auto opening %d percent (P6=%d P5=%d T=%d).",
+                             auto_opening, (int)lower, (int)upper, (int)temp_curr);
+                    opening_percentage_set = (double)auto_opening;
+                }
             }else if ( auto_opening != auto_hold_baseline ){
                 auto_hold_baseline = auto_opening;
-                if ( opening_to_int(opening_percentage_set) != auto_opening ){
-                    LOG_INFO("Auto opening %d percent.", auto_opening);
+                if ( current != auto_opening ){
+                    LOG_INFO("Auto opening %d percent (P6=%d P5=%d T=%d).",
+                             auto_opening, (int)lower, (int)upper, (int)temp_curr);
+                    opening_percentage_set = (double)auto_opening;
                 }
-                opening_percentage_set = (double)auto_opening;
             }
         }
     }else{
@@ -653,7 +754,7 @@ void VentilateService::eventloop(){
         Motor::State live_state = Motor::State::IDLE;
         motor->get_timer_cnt(live_cnt);
         motor->get_state(live_state);
-        int shown = opening_to_int(calc_opening_percent(live_cnt, config.motor_stroke_time));
+        int shown = opening_to_int(calc_opening_percent(live_cnt, config.motor_stroke_time, config.motor_turn_seconds));
         const bool leaving_zero = (force_action == VentilateService::ForceAction::ForceOpen)
             || (live_state == Motor::State::RUNNING_FORWARD)
             || (opening_percentage_set > 0.5);
@@ -661,12 +762,12 @@ void VentilateService::eventloop(){
             || (opening_percentage_set < 99.5)
             || (live_state == Motor::State::RUNNING_REVERSE);
         if ( (shown <= 0) && (leaving_zero == false) ){
-            hold_opening(0.0, config.motor_stroke_time);
+            hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
             force_action = VentilateService::ForceAction::None;
             motor->set_ignore_stall(false);
             end_stop_latched = true;
         }else if ( (shown >= 100) && (leaving_hundred == false) ){
-            hold_opening(100.0, config.motor_stroke_time);
+            hold_opening(100.0, config.motor_stroke_time, config.motor_turn_seconds);
             force_action = VentilateService::ForceAction::None;
             motor->set_ignore_stall(false);
             end_stop_latched = true;
@@ -689,6 +790,42 @@ bool VentilateService::set_opening_percentage(int value){
     end_stop_latched = false;
     abort_opening_persist();
     opening_percentage_set = clamp_opening((double)value);
+    close_run_latched = false;
+    return true;
+}
+
+bool VentilateService::set_target_turns(int turns){
+    if ( ventilate_service_status == VentilateService::Status::ALIGN || ventilate_service_status == VentilateService::Status::CALIBRATING_STAGE1 || ventilate_service_status == VentilateService::Status::CALIBRATING_STAGE2 || ventilate_service_status == VentilateService::Status::CALIBRATING_STAGE3  ){
+        return false;
+    }
+    Config_t cfg;
+    ConfigService::get_config(cfg);
+    int stroke = cfg.motor_stroke_time;
+    if ( stroke < MOTOR_STROKE_TURNS_MIN ){
+        stroke = MOTOR_STROKE_TURNS_MIN;
+    }else if ( stroke > MOTOR_STROKE_TURNS_MAX ){
+        stroke = MOTOR_STROKE_TURNS_MAX;
+    }
+    if ( turns < 0 ){
+        turns = 0;
+    }
+    if ( turns > stroke ){
+        turns = stroke;
+    }
+    double opening = 0.0;
+    if ( turns >= stroke ){
+        opening = 100.0;
+    }else if ( turns <= 0 ){
+        opening = 0.0;
+    }else{
+        opening = ((double)turns * 100.0) / (double)stroke;
+    }
+    end_stop_latched = false;
+    abort_opening_persist();
+    close_run_latched = false;
+    opening_percentage_set = clamp_opening(opening);
+    LOG_INFO("Set target turns %d -> opening %.2f percent (C1=%d).",
+             turns, opening_percentage_set, stroke);
     return true;
 }
 
@@ -704,7 +841,7 @@ bool VentilateService::get_opening_percentage(int &value){
     if ( motor != nullptr ){
         motor->get_timer_cnt(motor_timer_cnt);
     }
-    double shown = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time));
+    double shown = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds));
     value = (int)(shown + 0.5);
     if ( value < 0 ){
         value = 0;
@@ -712,6 +849,56 @@ bool VentilateService::get_opening_percentage(int &value){
     if ( value > 100 ){
         value = 100;
     }
+    return true;
+}
+
+bool VentilateService::get_current_turns(int &turns){
+    Config_t config;
+    ConfigService::get_config(config);
+    int stroke = config.motor_stroke_time;
+    if ( stroke < MOTOR_STROKE_TURNS_MIN ){
+        stroke = MOTOR_STROKE_TURNS_MIN;
+    }else if ( stroke > MOTOR_STROKE_TURNS_MAX ){
+        stroke = MOTOR_STROKE_TURNS_MAX;
+    }
+    int sec = config.motor_turn_seconds;
+    if ( (sec < MOTOR_TURN_SECONDS_MIN) || (sec > MOTOR_TURN_SECONDS_MAX) ){
+        sec = MOTOR_TURN_SECONDS_DEFAULT;
+    }
+
+    if ( ventilate_service_status == Status::ALIGN ){
+        turns = 0;
+        return true;
+    }
+
+    int opening = 0;
+    get_opening_percentage(opening);
+    if ( opening <= 0 ){
+        turns = 0;
+        return true;
+    }
+    if ( opening >= 100 ){
+        turns = stroke;
+        return true;
+    }
+
+    int64_t cnt = 0;
+    if ( motor != nullptr ){
+        motor->get_timer_cnt(cnt);
+    }
+    if ( cnt < 0 ){
+        cnt = 0;
+    }
+    /* timer_cnt 约 1ms/tick；已转秒=cnt/1000。整数圈=秒/C2，未满 1 圈为 0.
+     * 例：C1=10 C2=25 → 满行程 250s 才到 10 圈，不是几秒. */
+    int t = (int)(cnt / (1000LL * (int64_t)sec));
+    if ( t > stroke ){
+        t = stroke;
+    }
+    if ( t < 0 ){
+        t = 0;
+    }
+    turns = t;
     return true;
 }
 
@@ -740,7 +927,7 @@ bool VentilateService::on_mode_changed(void){
     motor->get_timer_cnt(motor_timer_cnt);
     double opening = 0.0;
     if ( motor_timer_cnt > 0 ){
-        opening = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time));
+        opening = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds));
     }else{
         motor->reset_timer();
     }
@@ -792,6 +979,7 @@ bool VentilateService::force(ForceAction action){
         force_action = action;
         motor->set_ignore_stall(true);
         if ( force_action == ForceAction::ForceOpen ){
+            close_run_latched = false;
             if ( opening_to_int(opening_percentage_curr) >= 100 ){
                 stop_force_and_hold(100.0);
             }else{
@@ -805,6 +993,7 @@ bool VentilateService::force(ForceAction action){
                 motor->execute_action(Motor::Action::FORWARD);
             }
         }else{
+            close_run_latched = true;
             if ( opening_to_int(opening_percentage_curr) <= 0 ){
                 stop_force_and_hold(0.0);
             }else{
@@ -812,10 +1001,15 @@ bool VentilateService::force(ForceAction action){
                 motor->execute_action(Motor::Action::REVERSE);
             }
         }
-    }else if ( action == ForceAction::None ){
+    }else if ( action == ForceAction::None || action == ForceAction::ForceStop ){
+        LOG_INFO("Motor stopped.");
         Config_t config;
         ConfigService::get_config(config);
         force_action = ForceAction::None;
+        close_run_latched = false;
+        abort_opening_persist();
+        auto_hold_pending = true;
+        auto_hold_baseline = -1;
         restore_saved_opening = false;
         align_stay_closed = false;
         motor->set_home_seek(false);
@@ -829,7 +1023,7 @@ bool VentilateService::force(ForceAction action){
             opening_percentage_curr = 0.0;
             opening_percentage_set = 0.0;
         }else{
-            opening_percentage_curr = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time));
+            opening_percentage_curr = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds));
             opening_percentage_set = opening_percentage_curr;
             if ( opening_to_int(opening_percentage_curr) <= 0 ){
                 motor->reset_timer();
