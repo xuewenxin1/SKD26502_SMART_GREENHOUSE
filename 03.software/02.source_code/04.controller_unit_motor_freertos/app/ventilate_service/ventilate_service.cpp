@@ -43,6 +43,10 @@ static unsigned int end_zero_hit_cnt = 0;
 static const TickType_t END_ZERO_MS = 3000;
 static const unsigned int END_ZERO_MIN_HITS = 4;
 static const double END_ZERO_CURRENT = 0.2;
+/* 全关到 0% 后再多转 1s；停时计时写回 0，圈数不因多转增加. */
+static bool close_overshoot_active = false;
+static TickType_t close_overshoot_since_tick = 0;
+static const TickType_t CLOSE_OVERSHOOT_MS = 1000;
 /* 真正反转/正转过之后才允许终点吸附清零或拉满；刚下发 0/最大圈数时不能瞬间跳变. */
 static bool close_run_latched = false;
 static bool open_run_latched = false;
@@ -468,6 +472,7 @@ static void release_end_seek_if_near(int shown){
 }
 
 static void begin_end_confirm_from_stop(int8_t dir);
+static void arrive_at_end(double opening, int stroke_turns, int turn_seconds);
 
 static bool seeking_mechanical_end(void){
     if ( force_action == VentilateService::ForceAction::ForceOpen ){
@@ -490,14 +495,24 @@ static void reset_end_zero_track(void){
     end_zero_hit_cnt = 0;
 }
 
-/* 寻限位停转：堵转（电流≈0 连续 3s 且≥4 次）或开度到 0%/100%，再进 IDLE 5s 确认. */
+static void reset_close_overshoot(void){
+    close_overshoot_active = false;
+    close_overshoot_since_tick = 0;
+}
+
+/* 寻限位停转：
+ * - 堵转（电流≈0 连续 3s 且≥4 次）→ STOP 后 IDLE 5s 再到头
+ * - 全开到满行程 → 直接到头（不等 IDLE 5s，不多转）
+ * - 全关到 0% → 多转 1s 后直接到头（不等 IDLE 5s）；计时保持 0 */
 static void process_end_zero_limit(const Config_t &config){
     if ( (end_confirm_dir != 0) || end_stop_latched ){
         reset_end_zero_track();
+        reset_close_overshoot();
         return;
     }
     if ( (seeking_mechanical_end() == false) || (force_motion_seen == false) ){
         reset_end_zero_track();
+        reset_close_overshoot();
         return;
     }
     Motor::State state = Motor::State::IDLE;
@@ -514,26 +529,50 @@ static void process_end_zero_limit(const Config_t &config){
 
     int64_t cnt = 0;
     motor->get_timer_cnt(cnt);
-    const int shown = opening_to_int(
-        calc_opening_percent(cnt, config.motor_stroke_time, config.motor_turn_seconds));
-    if ( seek_open && (shown >= 100) ){
-        LOG_INFO("End limit: opening 100%%, stop then wait IDLE 5s.");
+    /* 满行程按 C1×C2 计时判 100%，不用开度四舍五入（否则约 9.95 圈就判满，屏上显示 9 圈）. */
+    const int64_t full_ms =
+        (int64_t)stroke_seconds(config.motor_stroke_time, config.motor_turn_seconds) * 1000LL;
+    const bool at_full_open = (full_ms > 0) && (cnt >= full_ms);
+    const bool at_soft_zero = (cnt <= 0);
+    const TickType_t now = xTaskGetTickCount();
+
+    /* 全开到满行程：直接到头（不多转、不等 IDLE 5s）. */
+    if ( seek_open && at_full_open ){
+        LOG_INFO("Open full stroke (%d ms), arrive immediately (no overshoot).", (int)full_ms);
+        motor->set_timer_cnt(full_ms);
         motor->execute_action(Motor::Action::STOP);
         reset_end_zero_track();
-        begin_end_confirm_from_stop(1);
+        reset_close_overshoot();
+        arrive_at_end(100.0, config.motor_stroke_time, config.motor_turn_seconds);
         return;
     }
-    if ( seek_close && (shown <= 0) ){
-        LOG_INFO("End limit: opening 0%%, stop then wait IDLE 5s.");
-        motor->execute_action(Motor::Action::STOP);
-        reset_end_zero_track();
-        begin_end_confirm_from_stop(2);
-        return;
+
+    /* 全关到 0%：多转 1s 后直接到头（计时保持 0）. */
+    if ( seek_close && (at_soft_zero || close_overshoot_active) ){
+        if ( close_overshoot_active == false ){
+            close_overshoot_active = true;
+            close_overshoot_since_tick = now;
+            motor->set_timer_cnt(0);
+            LOG_INFO("Close 0%%, overshoot 1s (timer hold 0).");
+        }else{
+            motor->set_timer_cnt(0);
+            if ( (now - close_overshoot_since_tick) >= pdMS_TO_TICKS(CLOSE_OVERSHOOT_MS) ){
+                LOG_INFO("Close overshoot 1s done, arrive immediately (no IDLE 5s).");
+                motor->set_timer_cnt(0);
+                motor->execute_action(Motor::Action::STOP);
+                reset_end_zero_track();
+                reset_close_overshoot();
+                arrive_at_end(0.0, config.motor_stroke_time, config.motor_turn_seconds);
+                return;
+            }
+        }
+        /* 多转未满 1s：继续下面堵转检测，可提前停并走 IDLE 5s. */
+    }else if ( close_overshoot_active && (seek_close == false) ){
+        reset_close_overshoot();
     }
 
     double current = 0.0;
     motor->get_current(current);
-    const TickType_t now = xTaskGetTickCount();
     if ( current < END_ZERO_CURRENT ){
         if ( end_zero_since_tick == 0 ){
             end_zero_since_tick = now;
@@ -548,8 +587,12 @@ static void process_end_zero_limit(const Config_t &config){
             const int8_t dir = seek_open ? 1 : 2;
             LOG_INFO("End limit: current~0 for 3s (%u hits), stop then wait IDLE 5s.",
                      end_zero_hit_cnt);
+            if ( close_overshoot_active ){
+                motor->set_timer_cnt(0);
+            }
             motor->execute_action(Motor::Action::STOP);
             reset_end_zero_track();
+            reset_close_overshoot();
             begin_end_confirm_from_stop(dir);
         }
     }else{
@@ -621,6 +664,7 @@ static void arrive_at_end(double opening, int stroke_turns, int turn_seconds){
     motor->set_ignore_stall(false);
     motor->set_ignore_zero_current(false);
     reset_end_zero_track();
+    reset_close_overshoot();
     end_stop_latched = true;
     end_confirm_dir = 0;
     end_idle_since_tick = 0;
