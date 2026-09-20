@@ -281,7 +281,7 @@ bool ConfigService::store(){
     erase_init_config.NbPages = 1;
     uint32_t page_error = 0;
 
-    /* 与 LCD 软件 I2C 互斥；不要 vTaskSuspendAll（长擦写会卡住刷屏）. */
+    /* 与 LCD 软件 I2C 互斥；不要 vTaskSuspendAll / 关总中断. */
     hw_lock();
     HAL_FLASH_Unlock();
     if ( HAL_FLASH_Erase(&erase_init_config,&page_error) == HAL_OK ){
@@ -289,5 +289,9 @@ bool ConfigService::store(){
     }
     HAL_FLASH_Lock();
     hw_unlock();
+    /* 让出 CPU，避免连续落盘饿死刷屏. */
+    if ( xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED ){
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
     return true;
 }

@@ -8,6 +8,10 @@
 #include "iot_service.hpp"
 #include "ventilate_service.hpp"
 #include "systimer.hpp"
+#include "py32f071_hal_cortex.h"
+
+/* Main 周期 100ms；GUI 心跳停满该拍数则软复位. */
+#define GUI_HEARTBEAT_STALL_LOOPS 100u /* 10s */
 
 int main(){
     /* 系统初始化序列. */
@@ -90,8 +94,33 @@ int main(){
     LOG_INFO("System startup complete.");
     LOG_INFO("Free Heap Size: %d.", free_heap_size);
 
+    unsigned int last_gui_hb = GUI::heartbeat_tick();
+    unsigned int gui_stall_loops = 0;
+    bool gui_hb_seen = false;
+
     while ( true ){
+        /* 先电机后采样：避免 AHT 忙等拖住本拍驱动. */
         VentilateService::eventloop();
+        Env::eventloop();
+
+        /* GUI 刷屏心跳：首次见到后再计时，停满 10s 停电机并软复位. */
+        {
+            unsigned int hb = GUI::heartbeat_tick();
+            if ( hb != last_gui_hb ){
+                last_gui_hb = hb;
+                gui_stall_loops = 0;
+                gui_hb_seen = true;
+            }else if ( gui_hb_seen ){
+                gui_stall_loops++;
+                if ( gui_stall_loops >= GUI_HEARTBEAT_STALL_LOOPS ){
+                    LOG_ERROR("GUI heartbeat stall 10s, soft reset.");
+                    VentilateService::force(VentilateService::ForceAction::None);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    HAL_NVIC_SystemReset();
+                }
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     return 0;

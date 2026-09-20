@@ -5,10 +5,14 @@
 #include "env.hpp"
 #include "config.hpp"
 #include "ventilate_service.hpp"
-#include "end_stop_policy.hpp"
 #include "iot_service.hpp"
 #include "FreeRTOS.h"
 #include "task.h"
+
+extern void IOTService_request_up_status();
+extern void IOTService_request_up_status_run(uint8_t run);
+extern void IOTService_request_up_act(uint8_t act, uint16_t param);
+extern void IOTService_request_up_config();
 
 /* 1 = 显示 D1-D4 定时设置；0 = 暂时隐藏. */
 #ifndef GUI_ENABLE_D1_D4_SETTING
@@ -81,6 +85,11 @@ static uint8_t g_day;
 static uint8_t g_hour;
 static uint8_t g_minute;
 static uint8_t g_id[6];
+static volatile unsigned int gui_heartbeat = 0;
+
+unsigned int heartbeat_tick(void){
+    return gui_heartbeat;
+}
 
 void set_time_and_id(uint8_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t minute, uint8_t id[6]){
     g_year = year;
@@ -175,19 +184,29 @@ bool refresh_home_page(){
     Display::set_num_seg(Display::NUM_SEG_OPENING_PERCENTAGE_S3, '0' + (current_turns % 10));
     Display::set_pixel(Display::PIX_OPENING_PERCENTAGE_SYM_PERCENTAGE,0);
     
-    /* 指示电机状态. 开机找零：关窗过程关灯亮；电流到 0 且电机停住后断电、关灯灭. */
+    /* 指示电机状态. 寻限位/5s 确认中保持开/关灯；到头后灭灯. */
     Display::set_pixel(Display::PIX_MOTOR_STATUS_OPENING, 0);
     Display::set_pixel(Display::PIX_MOTOR_STATUS_CLOSING, 0);
     VentilateService::Status venti_status = VentilateService::Status::STOPPED;
     VentilateService::get_status(venti_status);
-    if ( (venti_status == VentilateService::Status::ALIGN)
-         && (motor_state == Motor::State::RUNNING_REVERSE) ){
-        Display::set_pixel(Display::PIX_MOTOR_STATUS_CLOSING, 1);
-    }else if ( (opening_percentage > 0) && (opening_percentage < 100) ){
-        if ( EndStopPolicy::open_lamp_on(motor_state == Motor::State::RUNNING_FORWARD, opening_percentage) ){
+    bool end_open_lamp = false;
+    bool end_close_lamp = false;
+    if ( VentilateService::end_confirm_lamp(end_open_lamp, end_close_lamp) ){
+        if ( end_open_lamp ){
             Display::set_pixel(Display::PIX_MOTOR_STATUS_OPENING, 1);
         }
-        if ( EndStopPolicy::close_lamp_on(motor_state == Motor::State::RUNNING_REVERSE, opening_percentage) ){
+        if ( end_close_lamp ){
+            Display::set_pixel(Display::PIX_MOTOR_STATUS_CLOSING, 1);
+        }
+    }else if ( (venti_status == VentilateService::Status::ALIGN)
+         && (motor_state == Motor::State::RUNNING_REVERSE) ){
+        Display::set_pixel(Display::PIX_MOTOR_STATUS_CLOSING, 1);
+    }else{
+        /* 中间行程：跟电机转向亮灯（含开度已到 100%/0% 仍在转）. */
+        if ( motor_state == Motor::State::RUNNING_FORWARD ){
+            Display::set_pixel(Display::PIX_MOTOR_STATUS_OPENING, 1);
+        }
+        if ( motor_state == Motor::State::RUNNING_REVERSE ){
             Display::set_pixel(Display::PIX_MOTOR_STATUS_CLOSING, 1);
         }
     }
@@ -543,6 +562,8 @@ bool refresh_motor_cali_page(){
 }
 
 bool refresh(){
+    /* 每次刷屏推进心跳，供 Main 约 10s 监视复位. */
+    gui_heartbeat++;
     switch ( current_page ){
         case Page::Home: {
             if ( refresh_home_page() != true ){
@@ -619,6 +640,9 @@ bool button_callback_home_page(Button button, ButtonEvent event){
         ConfigService::set_config(config);
         ConfigService::request_store();
         VentilateService::on_mode_changed();
+        /* 切模式：若本已停，状态机不报暂停，这里补一枪；并上报配置. */
+        IOTService_request_up_act(0, 0);
+        IOTService_request_up_config();
     }
     return true;
 }

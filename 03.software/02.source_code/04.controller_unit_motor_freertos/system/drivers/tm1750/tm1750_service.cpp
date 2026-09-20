@@ -105,13 +105,12 @@ bool TM1750_Service::flush(){
     if ( tm1750 == nullptr ){
         return false;
     }
-    /* 刷屏绝不长时间堵死 GUI：Flash 占用时跳过本帧；短临界区发 I2C，不用 SuspendAll. */
+    /* 与 Flash 互斥即可。禁止 taskENTER_CRITICAL：关中断会丢 4G UART 字节，
+     * 模组状态机乱掉后 IOT 狂打日志，GUI（刷屏+按键同任务）被饿死，表现为时间/配网码停、按键失灵. */
     if ( ConfigService::try_lock_hw() == false ){
         return false;
     }
-    taskENTER_CRITICAL();
     bool ok = tm1750->flush();
-    taskEXIT_CRITICAL();
     ConfigService::unlock_hw();
     return ok;
 }

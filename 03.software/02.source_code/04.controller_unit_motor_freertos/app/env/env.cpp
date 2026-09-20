@@ -48,7 +48,6 @@ static struct EnvStatus {
     },
 };
 
-static TaskHandle_t task_handle_env = nullptr;
 static bool temp_alarm_active = false;
 static bool buzzer_on = false;
 static TIM_HandleTypeDef htim_buzzer;
@@ -190,74 +189,76 @@ bool Env::init(){
     return true;
 }
 
-void Env_eventloop(void *param){
-    LOG_INFO("env service running.");
-    while ( true ){
-        /* 双插：NTC 温度 + 温湿度计湿度；只插温湿度计用其温湿度；只插 NTC 仅温度. */
-        double aht_temp = 0.0;
-        double aht_humi = 0.0;
-        double ntc_temp = 0.0;
-        bool aht_ok = AHT2415_Service::get(aht_temp, aht_humi);
-        bool ntc_ok = NTC_Service::get_temperature(ntc_temp);
-
-        if ( aht_ok ){
-            if ( (aht_humi < 0.0) || (aht_humi > 100.0)
-                 || (aht_temp < -40.0) || (aht_temp > 85.0) ){
-                aht_ok = false;
-            }
-        }
-
-        if ( ntc_ok && aht_ok ){
-            env_status.value.temperature = apply_temp_compensation(ntc_temp);
-            env_status.value.humidity = aht_humi;
-            env_status.valid_status.temperature = true;
-            env_status.valid_status.humidity = true;
-        }else if ( aht_ok ){
-            env_status.value.temperature = apply_temp_compensation(aht_temp);
-            env_status.value.humidity = aht_humi;
-            env_status.valid_status.temperature = true;
-            env_status.valid_status.humidity = true;
-        }else if ( ntc_ok ){
-            env_status.value.temperature = apply_temp_compensation(ntc_temp);
-            env_status.valid_status.temperature = true;
-            env_status.valid_status.humidity = false;
-        }else{
-            env_status.valid_status.temperature = false;
-            env_status.valid_status.humidity = false;
-        }
-        {
-            static unsigned int temp_src_log_cnt = 0;
-            if ( (temp_src_log_cnt++ % 10u) == 0u ){
-                Config_t cfg;
-                ConfigService::get_config(cfg);
-                const char *src = "none";
-                if ( ntc_ok && aht_ok ){
-                    src = "NTC";
-                }else if ( aht_ok ){
-                    src = "AHT";
-                }else if ( ntc_ok ){
-                    src = "NTC_only";
-                }
-                LOG_INFO("Temp src %s, ntc %.1f, aht %.1f, P4 %.1f, show %.1f C.",
-                         src,
-                         ntc_temp,
-                         aht_temp,
-                         (double)cfg.temp_compensation_value / 10.0,
-                         env_status.value.temperature);
-            }
-        }
-        /* 更新雨滴状态. */
-        env_status.value.rain_status = RainSensorService::get_rain_status();
-        update_temp_alarm();
-        vTaskDelay(pdMS_TO_TICKS(500));
+void Env::eventloop(void){
+    /* 约 500ms 采样一次（Main 周期 100ms）. */
+    static unsigned int skip = 0;
+    if ( (++skip % 5u) != 0u ){
+        return;
     }
+
+    /* 风机板以 NTC 为主；AHT 软件 I2C 忙等会拖死 Main，默认不读，仅偶发探测湿度. */
+    double aht_temp = 0.0;
+    double aht_humi = 0.0;
+    double ntc_temp = 0.0;
+    static unsigned int aht_probe_div = 0;
+    bool aht_ok = false;
+    bool ntc_ok = NTC_Service::get_temperature(ntc_temp);
+    if ( (++aht_probe_div % 40u) == 0u ){ /* ~20s 试一次 */
+        aht_ok = AHT2415_Service::get(aht_temp, aht_humi);
+    }
+
+    if ( aht_ok ){
+        if ( (aht_humi < 0.0) || (aht_humi > 100.0)
+             || (aht_temp < -40.0) || (aht_temp > 85.0) ){
+            aht_ok = false;
+        }
+    }
+
+    if ( ntc_ok && aht_ok ){
+        env_status.value.temperature = apply_temp_compensation(ntc_temp);
+        env_status.value.humidity = aht_humi;
+        env_status.valid_status.temperature = true;
+        env_status.valid_status.humidity = true;
+    }else if ( aht_ok ){
+        env_status.value.temperature = apply_temp_compensation(aht_temp);
+        env_status.value.humidity = aht_humi;
+        env_status.valid_status.temperature = true;
+        env_status.valid_status.humidity = true;
+    }else if ( ntc_ok ){
+        env_status.value.temperature = apply_temp_compensation(ntc_temp);
+        env_status.valid_status.temperature = true;
+        /* 未探测 AHT 时保留上次湿度，避免被清掉. */
+    }else{
+        env_status.valid_status.temperature = false;
+    }
+    {
+        static unsigned int temp_src_log_cnt = 0;
+        if ( (temp_src_log_cnt++ % 10u) == 0u ){
+            Config_t cfg;
+            ConfigService::get_config(cfg);
+            const char *src = "none";
+            if ( ntc_ok && aht_ok ){
+                src = "NTC";
+            }else if ( aht_ok ){
+                src = "AHT";
+            }else if ( ntc_ok ){
+                src = "NTC_only";
+            }
+            LOG_INFO("Temp src %s, ntc %d, aht %d, P4 %d, show %d C.",
+                     src,
+                     (int)ntc_temp,
+                     (int)aht_temp,
+                     cfg.temp_compensation_value,
+                     (int)env_status.value.temperature);
+        }
+    }
+    env_status.value.rain_status = RainSensorService::get_rain_status();
+    update_temp_alarm();
 }
 
 bool Env::start(){
-    if ( xTaskCreate(Env_eventloop,"env",256,nullptr,3,&task_handle_env) != pdPASS ){
-        LOG_ERROR("Can't create task for env service.");
-        return false;
-    }
+    /* 不建独立任务：IOT+GUI 已占满 9KB 堆，再建 env 必失败 → 温度永不更新 → fault 2. */
+    LOG_INFO("env service runs in Main (no dedicated task).");
     return true;
 }
 

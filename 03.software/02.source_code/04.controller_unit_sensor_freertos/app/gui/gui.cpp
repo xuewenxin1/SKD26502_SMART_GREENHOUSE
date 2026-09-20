@@ -852,7 +852,7 @@ static void GUI_eventloop(void *param){
 
 
 bool GUI::start(){
-    if ( xTaskCreate(GUI_eventloop,"gui",512,nullptr,10,&task_handle_gui) != pdPASS ){
+    if ( xTaskCreate(GUI_eventloop,"gui",512,nullptr,5,&task_handle_gui) != pdPASS ){
         LOG_ERROR("GUI task start failed.");
         return false;
     }

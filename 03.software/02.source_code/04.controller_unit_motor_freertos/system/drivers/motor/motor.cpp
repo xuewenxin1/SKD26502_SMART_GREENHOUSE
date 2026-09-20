@@ -15,6 +15,7 @@ Motor::Motor(PortableStrategy &portable_strategy,Parameter param) : portable_str
     this->home_seek = false;
     this->calibrating = false;
     this->ignore_stall = false;
+    this->ignore_zero_current = false;
     this->reset_motion_detect();
 }
 
@@ -95,8 +96,8 @@ void Motor::eventloop(){
     /* Overcurrent stop disabled: do not trip ERROR_OVC. */
     this->oc_cnt = 0;
     if ( current < this->param.zero_threshold ){
-        if ( this->home_seek ){
-            /* 找零：不停机，由上层连续 3 次电流 0 再停. */
+        if ( this->home_seek || this->ignore_zero_current ){
+            /* 寻限位：假零流不停，等堵转或上层确认. */
             this->stop_cnt = 0;
         }else if ( this->ignore_stall ){
             /* 定点/强制行程中途：忽略假零流，避免反复停机把调度/日志打爆、屏停住. */
@@ -115,7 +116,8 @@ void Motor::eventloop(){
         }
     }else{
         this->stop_cnt = 0;
-        if ( this->home_seek || this->calibrating || this->ignore_stall ){
+        /* home_seek 只放开软件 0 停转，不屏蔽堵转（否则关/开到机械限位永远不停）. */
+        if ( this->calibrating || this->ignore_stall ){
             this->stall_cnt = 0;
         }else if ( this->limit_ignore_cnt > 0 ){
             this->stall_cnt = 0;
@@ -201,5 +203,12 @@ void Motor::set_ignore_stall(bool enable){
     this->ignore_stall = enable;
     if ( enable ){
         this->stall_cnt = 0;
+    }
+}
+
+void Motor::set_ignore_zero_current(bool enable){
+    this->ignore_zero_current = enable;
+    if ( enable ){
+        this->stop_cnt = 0;
     }
 }

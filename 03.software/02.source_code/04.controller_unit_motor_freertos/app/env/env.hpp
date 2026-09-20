@@ -6,6 +6,8 @@ namespace Env {
 bool init();
 
 bool start();
+/* 在 Main 任务里周期调用；不再单独建 env 任务（堆不够会建失败→假传感器故障）. */
+void eventloop(void);
 
 bool get_temperature(double &temperature);
 bool get_humidity(double &humidity);

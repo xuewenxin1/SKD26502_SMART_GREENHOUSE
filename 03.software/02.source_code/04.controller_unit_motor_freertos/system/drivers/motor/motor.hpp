@@ -55,6 +55,8 @@ public:
     void set_home_seek(bool enable);
     void set_calibrating(bool enable);
     void set_ignore_stall(bool enable);
+    /* 寻机械限位：忽略假零流，但仍检测堵转. */
+    void set_ignore_zero_current(bool enable);
 
     void eventloop();
 private:
@@ -74,6 +76,7 @@ private:
     bool home_seek;
     bool calibrating;
     bool ignore_stall;
+    bool ignore_zero_current;
 };
 
 #endif

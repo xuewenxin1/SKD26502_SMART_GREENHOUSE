@@ -35,6 +35,13 @@ static volatile uint16_t rx_w = 0;
 static volatile uint16_t rx_r = 0;
 static volatile uint8_t pending_up_status = 0;
 static volatile uint8_t pending_up_config = 0;
+/* 0xFF=无待发 up/act；否则为动作类型 0/2/3… */
+static volatile uint8_t pending_act_type = 0xFF;
+static volatile uint16_t pending_act_param = 0;
+/* 按键/ACT 意图：0=暂停 1=开 2=关；0xFF=无意图，按电机实时状态. */
+static volatile uint8_t pending_status_run = 0xFF;
+/* 各 up/* 上报共用，均在 IOT 任务内串行调用. */
+static char mqtt_up_topic[64];
 
 /* 下行先入队，避免在 URC/drain 回调里嵌套处理 ACT 导致 IOT 栈溢出卡死. */
 enum {
@@ -42,11 +49,11 @@ enum {
     DOWN_CONFIG = 2,
     DOWN_EXTRA = 3,
 };
-#define DOWN_Q_SIZE 2
+#define DOWN_Q_SIZE 4
 typedef struct {
     unsigned char type;
     unsigned char len;
-    unsigned char data[24];
+    unsigned char data[32]; /* config 扩包约 25 字节，留余量. */
 } DownItem_t;
 static DownItem_t down_q[DOWN_Q_SIZE];
 static volatile uint8_t down_w = 0;
@@ -190,11 +197,13 @@ static MqttPublishUrcHandler *mqtt_publish_urc_handler;
 static CgsnUrcHandler *cgsn_urc_handler;
 static bool g_mccid_flag = false;
 static bool g_imei_flag = false;
+static volatile unsigned char g_net_ok = 0; /* MQTT 已连接并订阅成功 */
 static char g_mccid[21] = {0};
 static char g_imei[16] = {0};
 
 static void message(const char *topic, const char *payload, unsigned int length){
-    LOG_INFO("MQTT topic:%s msg(%d):%s",topic,length,payload);
+    /* 热路径少打日志：长 LOG + 阻塞 printf 会饿死 GUI 任务. */
+    LOG_DEBUG("MQTT down len=%u", length);
     /* topic 来自 URC，可能带引号："greenhouse/<IMEI>/..." */
     if ( g_imei_flag ){
         const char *t = topic;
@@ -208,7 +217,7 @@ static void message(const char *topic, const char *payload, unsigned int length)
             return;
         }
     }
-    /* 新 config 包 23 字节 → Base64 正好 32 字符；缓冲需大于 32. */
+    /* 新 config 包含温度校准约 25 字节 → Base64 需大于 32. */
     char payload_buffer[64] = {0};
     unsigned char buffer[64] = {0};
 
@@ -232,7 +241,6 @@ static void message(const char *topic, const char *payload, unsigned int length)
         checksum_calculator.feed(buffer,len - 1);
         unsigned char f_checksum = checksum_calculator.get();
         if ( f_checksum == buffer[len - 1] ){
-            LOG_INFO("Decoded payload len:%d",len);
             if ( down_enqueue(topic, buffer, (unsigned int)len) == false ){
                 LOG_WARN("MQTT down queue full, drop.");
             }
@@ -261,6 +269,10 @@ static void cgsn(const char *imei, unsigned int length){
 static void mqtt_publish(char *topic,char *message,int length){
     static char publish_at_buffer[256] = {0};
     if ( length > 200 ){
+        return;
+    }
+    /* 未连上就发 MQTTPUB 会打乱模组 AT 状态，导致 MQTTCONN 失败、屏上不显示联网. */
+    if ( g_net_ok == 0 ){
         return;
     }
     unsigned int len = snprintf(publish_at_buffer,255,ATCMD_MQTT_PUBLISH,topic,length,message);
@@ -346,12 +358,15 @@ static void IOTService_wait_ms(unsigned int ms){
         wait = 1;
     }
     while ( (xTaskGetTickCount() - start) < wait ){
+        /* 等待期间只收字节入队，不在此处理 ACT/CONFIG（避免深层嵌套占栈、长时间占 CPU）. */
         IOTService_drain_rx();
-        down_process_pending();
-        vTaskDelay(pdMS_TO_TICKS(2));
+        /* 按键/下行触发的待上报：打断长等待，尽快发出. */
+        if ( (pending_up_status != 0) || (pending_up_config != 0) || (pending_act_type != 0xFFu) ){
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
     IOTService_drain_rx();
-    down_process_pending();
 }
 
 static bool IOTService_serv_init(){
@@ -372,11 +387,11 @@ static bool IOTService_serv_init(){
     while ( true ){
         IOTService_wait_ms(100);
         AT::CommandReturn ret = at->get_command_return();
-        if ( ret == AT::CommandReturn::Ok ){
+        if ( (ret == AT::CommandReturn::Ok) || g_imei_flag ){
             LOG_INFO("Get IMEI OK.");
             break;
         }
-        if ( cnt < 50 ){
+        if ( cnt < 80 ){
             cnt++;
         }else{
             LOG_ERROR("Get IMEI failed.");
@@ -389,11 +404,11 @@ static bool IOTService_serv_init(){
     while ( true ){
         IOTService_wait_ms(100);
         AT::CommandReturn ret = at->get_command_return();
-        if ( ret == AT::CommandReturn::Ok ){
+        if ( (ret == AT::CommandReturn::Ok) || g_mccid_flag ){
             LOG_INFO("Get MCCID OK.");
             break;
         }
-        if ( cnt < 50 ){
+        if ( cnt < 80 ){
             cnt++;
         }else{
             LOG_ERROR("Get MCCID failed.");
@@ -421,6 +436,7 @@ static bool IOTService_serv_init(){
     at->send(mqtt_conn_at, conn_len);
     cnt = 0;
     bool mqtt_ok = false;
+    /* 蜂窝建链常需 >5s，超时过短会误判失败. */
     while ( true ){
         IOTService_wait_ms(100);
         if ( at->get_command_return() == AT::CommandReturn::Ok ){
@@ -428,7 +444,7 @@ static bool IOTService_serv_init(){
             mqtt_ok = true;
             break;
         }
-        if ( cnt < 50 ){
+        if ( cnt < 150 ){
             cnt++;
         }else{
             LOG_ERROR("MQTT connect failed.");
@@ -466,7 +482,6 @@ static bool IOTService_serv_init(){
 
 /* 主题:greenhouse/vid/up/dev */
 static void IOTService_up_devinfo(){
-    static char topic[64] = {0};
     static char payload[64] = {0};
     ChecksumCalculator checksum_calculator;
 
@@ -477,15 +492,14 @@ static void IOTService_up_devinfo(){
     checksum_calculator.feed(payload,36);
     payload[36] = checksum_calculator.get();
 
-    snprintf(topic,63,"greenhouse/%s/up/dev",g_imei);
+    snprintf(mqtt_up_topic,63,"greenhouse/%s/up/dev",g_imei);
 
-    mqtt_publish_base64(topic,(unsigned char*)payload,37);
+    mqtt_publish_base64(mqtt_up_topic,(unsigned char*)payload,37);
     LOG_INFO("Report device info, type %d.", (int)DEVICE_TYPE);
 
 }
 
 void IOTService_up_status(){
-    static char topic[64] = {0};
     static char buffer[32] = {0};
 
     int opening_percentage = 0;
@@ -528,7 +542,12 @@ void IOTService_up_status(){
         }else{
             fault_code = 0;
         }
-        if ( motor_state == Motor::State::RUNNING_FORWARD ){
+        /* 有按键/ACT 意图时优先报意图，避免刚按开但采样时仍 IDLE → APP 当成暂停. */
+        uint8_t run_hint = pending_status_run;
+        if ( run_hint != 0xFFu ){
+            pending_status_run = 0xFFu;
+            motor_running_state = run_hint;
+        }else if ( motor_state == Motor::State::RUNNING_FORWARD ){
             motor_running_state = 1;
         }else if ( motor_state == Motor::State::RUNNING_REVERSE ){
             motor_running_state = 2;
@@ -539,7 +558,7 @@ void IOTService_up_status(){
     
     ChecksumCalculator checksum_calculator;
 
-    snprintf(topic,63,"greenhouse/%s/up/status",g_imei);
+    snprintf(mqtt_up_topic,63,"greenhouse/%s/up/status",g_imei);
 
     buffer[0] = (i16_temp & 0xff);
     buffer[1] = (i16_temp >> 8) & 0xff;
@@ -561,13 +580,13 @@ void IOTService_up_status(){
     checksum_calculator.feed(buffer,9);
     buffer[9] = checksum_calculator.get();
 
-    mqtt_publish_base64(topic,(unsigned char*)buffer,10);
-    LOG_INFO("Report turns %d (%d%% of %d), fault %u.",
+    mqtt_publish_base64(mqtt_up_topic,(unsigned char*)buffer,10);
+    LOG_INFO("Report status run %u, turns %d (%d%% of %d), fault %u.",
+             (unsigned int)motor_running_state,
              current_turns, opening_percentage, cfg.motor_stroke_time, (unsigned int)fault_code);
 }
 
 void IOTService_up_config(){
-    static char topic[64] = {0};
     static char payload[32] = {0};
     ChecksumCalculator checksum_calculator;
 
@@ -602,13 +621,55 @@ void IOTService_up_config(){
     checksum_calculator.feed(payload,24);
     payload[24] = checksum_calculator.get();
 
-    snprintf(topic,63,"greenhouse/%s/up/config",g_imei);
+    snprintf(mqtt_up_topic,63,"greenhouse/%s/up/config",g_imei);
 
-    mqtt_publish_base64(topic,(unsigned char*)payload,25);
+    mqtt_publish_base64(mqtt_up_topic,(unsigned char*)payload,25);
+}
+
+/* 协议：greenhouse/.../up/act 与 down/act 同格式：act(1)+param(2)+checksum(1). */
+void IOTService_up_act(uint8_t act, uint16_t param){
+    unsigned char buffer[4];
+    ChecksumCalculator checksum_calculator;
+
+    buffer[0] = act;
+    buffer[1] = (uint8_t)(param & 0xff);
+    buffer[2] = (uint8_t)((param >> 8) & 0xff);
+    checksum_calculator.start();
+    checksum_calculator.feed(buffer, 3);
+    buffer[3] = checksum_calculator.get();
+
+    snprintf(mqtt_up_topic, 63, "greenhouse/%s/up/act", g_imei);
+    mqtt_publish_base64(mqtt_up_topic, buffer, 4);
+    LOG_INFO("Report up/act %u param %u.", (unsigned int)act, (unsigned int)param);
 }
 
 void IOTService_request_up_status(){
     pending_up_status = 1;
+}
+
+/* run: 0=暂停 1=开 2=关，写入 up/status 的 motor_running_state. */
+void IOTService_request_up_status_run(uint8_t run){
+    if ( run > 2u ){
+        run = 0;
+    }
+    pending_status_run = run;
+    pending_up_status = 1;
+}
+
+/* 本地按键或 APP 下发确认：发 up/act（0停/1定点/2开/3关），并同步 up/status. */
+void IOTService_request_up_act(uint8_t act, uint16_t param){
+    pending_act_param = param;
+    pending_act_type = act; /* 非 0xFF 即待发 */
+    /* 同步 status 里的运行态，便于旧 APP. */
+    if ( act == 0u ){
+        IOTService_request_up_status_run(0);
+    }else if ( act == 2u ){
+        IOTService_request_up_status_run(1);
+    }else if ( act == 3u ){
+        IOTService_request_up_status_run(2);
+    }else{
+        IOTService_request_up_status();
+    }
 }
 
 void IOTService_request_up_config(){
@@ -697,40 +758,49 @@ static void message_loop(){
 void IOTService::eventloop(){
     static unsigned char boot_wait = 0;
     static unsigned char retry_wait = 0;
-    static unsigned char net_ok = 0;
 
     IOTService_drain_rx();
     down_process_pending();
     /* 联网成功后再擦 Flash。开机/AT 阶段落盘会丢模组串口，导致 APP 连不上. */
-    if ( net_ok != 0 ){
+    if ( g_net_ok != 0 ){
         if ( ConfigService::flush_store() ){
             IOTService_drain_rx();
             down_process_pending();
             LOG_INFO("Config flash flushed.");
         }
     }
-    if ( pending_up_status != 0 ){
-        pending_up_status = 0;
-        IOTService_up_status();
-        IOTService_wait_ms(50);
-    }
-    if ( pending_up_config != 0 ){
-        pending_up_config = 0;
-        IOTService_up_config();
-        IOTService_wait_ms(50);
+    /* 未 MQTT 连上前不发上报，避免 MQTTPUB 抢串口导致连不上. */
+    if ( g_net_ok != 0 ){
+        if ( pending_act_type != 0xFFu ){
+            uint8_t act = pending_act_type;
+            uint16_t param = pending_act_param;
+            pending_act_type = 0xFFu;
+            IOTService_up_act(act, param);
+            IOTService_wait_ms(50);
+        }
+        if ( pending_up_status != 0 ){
+            pending_up_status = 0;
+            IOTService_up_status();
+            IOTService_wait_ms(50);
+        }
+        if ( pending_up_config != 0 ){
+            pending_up_config = 0;
+            IOTService_up_config();
+            IOTService_wait_ms(50);
+        }
     }
 
     if ( boot_wait < 10 ){
         boot_wait++;
         return;
     }
-    if ( net_ok == 0 ){
+    if ( g_net_ok == 0 ){
         if ( retry_wait > 0 ){
             retry_wait--;
             return;
         }
         if ( IOTService_serv_init() ){
-            net_ok = 1;
+            g_net_ok = 1;
         }else{
             LOG_ERROR("MQTT init failed, retry in 15s.");
             retry_wait = 15;
@@ -743,23 +813,26 @@ void IOTService::eventloop(){
 }
 
 bool IOTService::get_network_status(){
-    if ( g_imei_flag && g_mccid_flag ){
-        return true;
-    }else{
-        return false;
-    }
+    /* 屏上联网图标：以 MQTT 真正连上为准，仅有 IMEI/卡号不算. */
+    return g_net_ok != 0;
 }
 
 static void IOTService_task(void *param){
     LOG_INFO("IOT service running.");
     while ( true ){
         IOTService::eventloop();
-        IOTService_wait_ms(1000);
+        /* 有待上报时缩短轮询，按键后尽快发出 status（否则最多拖 ~1s）. */
+        if ( (pending_up_status != 0) || (pending_up_config != 0) || (pending_act_type != 0xFFu) ){
+            IOTService_wait_ms(50);
+        }else{
+            IOTService_wait_ms(1000);
+        }
     }
 }
 
 bool IOTService::start(){
-    if ( xTaskCreate(IOTService_task,"iot",384,nullptr,5,&task_handle_iot) != pdPASS ){
+    /* 优先级低于 GUI(5)：联网/打日志阻塞时仍要刷屏与扫键. */
+    if ( xTaskCreate(IOTService_task,"iot",448,nullptr,4,&task_handle_iot) != pdPASS ){
         LOG_ERROR("IOT task start failed.");
         return false;
     }

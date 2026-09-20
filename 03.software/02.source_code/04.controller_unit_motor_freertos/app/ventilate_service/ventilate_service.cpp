@@ -9,6 +9,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+extern void IOTService_request_up_act(uint8_t act, uint16_t param);
+
 static Motor *motor;
 static VentilateService::Status ventilate_service_status;
 static VentilateService::ForceAction force_action = VentilateService::ForceAction::None;
@@ -31,6 +33,16 @@ static unsigned int align_budget_loops = 300;
 static unsigned int align_zero_curr_cnt = 0;
 static bool align_wait_zero = false;
 static bool end_stop_latched = false;
+/* 限位确认：到端后先不停转，电机 IDLE 连续 5s 再判到头灭灯. */
+static int8_t end_confirm_dir = 0; /* 0=无 1=开端 2=关端 */
+static TickType_t end_idle_since_tick = 0;
+static const TickType_t END_IDLE_MS = 5000;
+/* 寻机械限位：电流连续≈0 满 3s，且至少采到 4 次，才停转. */
+static TickType_t end_zero_since_tick = 0;
+static unsigned int end_zero_hit_cnt = 0;
+static const TickType_t END_ZERO_MS = 3000;
+static const unsigned int END_ZERO_MIN_HITS = 4;
+static const double END_ZERO_CURRENT = 0.2;
 /* 真正反转/正转过之后才允许终点吸附清零或拉满；刚下发 0/最大圈数时不能瞬间跳变. */
 static bool close_run_latched = false;
 static bool open_run_latched = false;
@@ -47,6 +59,8 @@ static bool clock_valid = false;
 static uint8_t clock_hour = 0;
 static uint8_t clock_minute = 0;
 static TaskHandle_t task_handle_ventilate = nullptr;
+/* 电机态变化时上报 up/act：开=2 关=3 暂停=0（含堵转/零流自停）. */
+static Motor::State last_act_report_state = Motor::State::IDLE;
 
 static double clamp_opening(double value);
 static void abort_opening_persist(void);
@@ -68,6 +82,9 @@ static void finish_align_home(const Config_t &config){
     motor->reset_timer();
     align_wait_zero = false;
     align_zero_curr_cnt = 0;
+    end_stop_latched = true; /* 回零后按 0 位记忆，上报当前圈数 0. */
+    end_confirm_dir = 0;
+    end_idle_since_tick = 0;
     if ( align_stay_closed ){
         opening_percentage_set = 0;
         align_stay_closed = false;
@@ -82,6 +99,7 @@ static void finish_align_home(const Config_t &config){
         }
         opening_percentage_set = (double)saved;
         restore_saved_opening = false;
+        end_stop_latched = false;
         LOG_INFO("ALIGN restore saved opening %d percent.", saved);
     }else{
         opening_percentage_set = 0;
@@ -374,24 +392,16 @@ static double calc_opening_percent(int64_t motor_timer_cnt, int stroke_turns, in
     return ((double)motor_timer_cnt / 10.0) / stroke;
 }
 
-static void hold_opening(double opening, int stroke_turns, int turn_seconds){
-    opening = clamp_opening(opening);
-    motor->execute_action(Motor::Action::STOP);
-    target_by_timer = false;
-    if ( opening <= 0.0 ){
-        motor->reset_timer();
-        opening_percentage_curr = 0.0;
-        close_run_latched = false;
-    }else{
-        int stroke = stroke_seconds(stroke_turns, turn_seconds);
-        int64_t cnt = (int64_t)(opening * 10.0 * (double)stroke + 0.5);
-        motor->set_timer_cnt(cnt);
-        opening_percentage_curr = opening;
-        if ( opening >= 100.0 ){
-            open_run_latched = false;
-        }
+/* 关到头：剩余行程计时 ≤5s 才可视为已到 0%，超出不算. */
+static const int64_t CLOSE_ZERO_SLACK_MS = 5000;
+
+static bool close_enough_to_zero(int64_t cnt, int stroke_turns, int turn_seconds){
+    (void)stroke_turns;
+    (void)turn_seconds;
+    if ( cnt <= 0 ){
+        return true;
     }
-    opening_percentage_set = opening_percentage_curr;
+    return cnt <= CLOSE_ZERO_SLACK_MS;
 }
 
 static void heal_negative_timer(void){
@@ -428,6 +438,262 @@ static void drive(Motor::Action action){
     motor->execute_action(action);
 }
 
+/* 关到 0：越过软件 0；驱动层不因短零流/堵转秒停，由上层 3s 连续≈0 再停. */
+static void arm_close_to_mechanical_end(void){
+    close_run_latched = true;
+    open_run_latched = false;
+    motor->set_home_seek(true);
+    motor->set_ignore_stall(true);
+    motor->set_ignore_zero_current(true);
+}
+
+/* 开到满：同上，电流连续≈0 满 3s 才停，再 IDLE 5s 到头. */
+static void arm_open_to_mechanical_end(void){
+    open_run_latched = true;
+    close_run_latched = false;
+    motor->set_home_seek(false);
+    motor->set_ignore_stall(true);
+    motor->set_ignore_zero_current(true);
+}
+
+static void release_end_seek_if_near(int shown){
+    (void)shown;
+    if ( (force_action == VentilateService::ForceAction::ForceOpen)
+         || (force_action == VentilateService::ForceAction::ForceClose)
+         || (open_run_latched && (opening_percentage_set >= 99.5))
+         || (close_run_latched && (opening_percentage_set <= 0.5)) ){
+        motor->set_ignore_stall(true);
+        motor->set_ignore_zero_current(true);
+    }
+}
+
+static void begin_end_confirm_from_stop(int8_t dir);
+
+static bool seeking_mechanical_end(void){
+    if ( force_action == VentilateService::ForceAction::ForceOpen ){
+        return true;
+    }
+    if ( force_action == VentilateService::ForceAction::ForceClose ){
+        return true;
+    }
+    if ( open_run_latched && (opening_percentage_set >= 99.5) ){
+        return true;
+    }
+    if ( close_run_latched && (opening_percentage_set <= 0.5) ){
+        return true;
+    }
+    return false;
+}
+
+static void reset_end_zero_track(void){
+    end_zero_since_tick = 0;
+    end_zero_hit_cnt = 0;
+}
+
+/* 寻限位停转：堵转（电流≈0 连续 3s 且≥4 次）或开度到 0%/100%，再进 IDLE 5s 确认. */
+static void process_end_zero_limit(const Config_t &config){
+    if ( (end_confirm_dir != 0) || end_stop_latched ){
+        reset_end_zero_track();
+        return;
+    }
+    if ( (seeking_mechanical_end() == false) || (force_motion_seen == false) ){
+        reset_end_zero_track();
+        return;
+    }
+    Motor::State state = Motor::State::IDLE;
+    motor->get_state(state);
+    if ( (state != Motor::State::RUNNING_FORWARD)
+         && (state != Motor::State::RUNNING_REVERSE) ){
+        return;
+    }
+
+    const bool seek_open = (force_action == VentilateService::ForceAction::ForceOpen)
+        || (open_run_latched && (opening_percentage_set >= 99.5));
+    const bool seek_close = (force_action == VentilateService::ForceAction::ForceClose)
+        || (close_run_latched && (opening_percentage_set <= 0.5));
+
+    int64_t cnt = 0;
+    motor->get_timer_cnt(cnt);
+    const int shown = opening_to_int(
+        calc_opening_percent(cnt, config.motor_stroke_time, config.motor_turn_seconds));
+    if ( seek_open && (shown >= 100) ){
+        LOG_INFO("End limit: opening 100%%, stop then wait IDLE 5s.");
+        motor->execute_action(Motor::Action::STOP);
+        reset_end_zero_track();
+        begin_end_confirm_from_stop(1);
+        return;
+    }
+    if ( seek_close && (shown <= 0) ){
+        LOG_INFO("End limit: opening 0%%, stop then wait IDLE 5s.");
+        motor->execute_action(Motor::Action::STOP);
+        reset_end_zero_track();
+        begin_end_confirm_from_stop(2);
+        return;
+    }
+
+    double current = 0.0;
+    motor->get_current(current);
+    const TickType_t now = xTaskGetTickCount();
+    if ( current < END_ZERO_CURRENT ){
+        if ( end_zero_since_tick == 0 ){
+            end_zero_since_tick = now;
+            end_zero_hit_cnt = 1;
+            return;
+        }
+        if ( end_zero_hit_cnt < 1000U ){
+            end_zero_hit_cnt++;
+        }
+        if ( (end_zero_hit_cnt >= END_ZERO_MIN_HITS)
+             && ((now - end_zero_since_tick) >= pdMS_TO_TICKS(END_ZERO_MS)) ){
+            const int8_t dir = seek_open ? 1 : 2;
+            LOG_INFO("End limit: current~0 for 3s (%u hits), stop then wait IDLE 5s.",
+                     end_zero_hit_cnt);
+            motor->execute_action(Motor::Action::STOP);
+            reset_end_zero_track();
+            begin_end_confirm_from_stop(dir);
+        }
+    }else{
+        reset_end_zero_track();
+    }
+}
+
+static void report_act_on_motor_state_change(void){
+    Motor::State state = Motor::State::IDLE;
+    motor->get_state(state);
+    if ( state == last_act_report_state ){
+        return;
+    }
+    if ( state == Motor::State::RUNNING_FORWARD ){
+        IOTService_request_up_act(2, 0);
+        LOG_INFO("Report up/act open (motor forward).");
+    }else if ( state == Motor::State::RUNNING_REVERSE ){
+        IOTService_request_up_act(3, 0);
+        LOG_INFO("Report up/act close (motor reverse).");
+    }else if ( state == Motor::State::IDLE ){
+        if ( (last_act_report_state == Motor::State::RUNNING_FORWARD)
+             || (last_act_report_state == Motor::State::RUNNING_REVERSE) ){
+            IOTService_request_up_act(0, 0);
+            LOG_INFO("Report up/act pause (motor idle).");
+        }
+    }
+    last_act_report_state = state;
+}
+
+static void reset_end_confirm(void){
+    end_confirm_dir = 0;
+    end_idle_since_tick = 0;
+}
+
+/* 进入限位确认：灯保持亮，电机 IDLE 满 5s 再 arrive. */
+static void begin_end_confirm(int8_t dir){
+    if ( dir == 0 ){
+        return;
+    }
+    if ( end_confirm_dir != dir ){
+        end_confirm_dir = dir;
+        end_idle_since_tick = 0;
+        LOG_INFO("End confirm start dir=%d, wait IDLE 5s.", (int)dir);
+    }
+}
+
+/* 电机刚停转入确认时重置 5s 计时（避免沿用旧 tick 秒到）. */
+static void begin_end_confirm_from_stop(int8_t dir){
+    if ( dir == 0 ){
+        return;
+    }
+    if ( end_confirm_dir != dir ){
+        LOG_INFO("End confirm start dir=%d, wait IDLE 5s.", (int)dir);
+    }
+    end_confirm_dir = dir;
+    end_idle_since_tick = 0;
+}
+
+/* 到头：停转；关端清零，开端保留实际计时圈数（勿吸附成 C1）. */
+static void arrive_at_end(double opening, int stroke_turns, int turn_seconds){
+    const bool first = (end_stop_latched == false);
+    motor->execute_action(Motor::Action::STOP);
+    force_action = VentilateService::ForceAction::None;
+    target_by_timer = false;
+    open_run_latched = false;
+    close_run_latched = false;
+    force_motion_seen = false;
+    motor->set_home_seek(false);
+    motor->set_ignore_stall(false);
+    motor->set_ignore_zero_current(false);
+    reset_end_zero_track();
+    end_stop_latched = true;
+    end_confirm_dir = 0;
+    end_idle_since_tick = 0;
+    ventilate_service_status = VentilateService::Status::STOPPED;
+
+    if ( opening <= 0.5 ){
+        /* 关到位：差得不多也清成 0% / 0 圈. */
+        int64_t cnt = 0;
+        motor->get_timer_cnt(cnt);
+        if ( (cnt > 0) && (close_enough_to_zero(cnt, stroke_turns, turn_seconds) == false) ){
+            /* 异常偏大仍强制归零（机械关限位就是零点）. */
+            LOG_INFO("Arrive close end with large residual timer %d ms, force zero.", (int)cnt);
+        }
+        motor->reset_timer();
+        opening_percentage_curr = 0.0;
+        opening_percentage_set = 0.0;
+        if ( first ){
+            IOTService_request_up_act(0, 0);
+            LOG_INFO("Arrive 0 percent, lamp off, report pause.");
+        }
+    }else{
+        /* 开到位：计时保持机械限位时的实际行程，上报圈数用它，不改写成 C1. */
+        int64_t cnt = 0;
+        motor->get_timer_cnt(cnt);
+        if ( cnt < 0 ){
+            motor->reset_timer();
+            cnt = 0;
+        }
+        int sec = effective_turn_seconds(turn_seconds);
+        int actual_turns = 0;
+        if ( sec > 0 ){
+            actual_turns = (int)(cnt / (1000LL * (int64_t)sec));
+            if ( actual_turns < 0 ){
+                actual_turns = 0;
+            }
+        }
+        opening_percentage_curr = 100.0;
+        opening_percentage_set = 100.0;
+        if ( first ){
+            IOTService_request_up_act(0, 0);
+            LOG_INFO("Arrive open end, keep actual %d turns (timer %d ms, C1=%d), lamp off, report pause.",
+                     actual_turns, (int)cnt, stroke_turns);
+        }
+    }
+}
+
+static void process_end_confirm(const Config_t &config){
+    if ( (end_confirm_dir == 0) || end_stop_latched ){
+        return;
+    }
+    Motor::State state = Motor::State::IDLE;
+    motor->get_state(state);
+    /* 还在转：不累计，灯保持亮. */
+    if ( (state == Motor::State::RUNNING_FORWARD)
+         || (state == Motor::State::RUNNING_REVERSE) ){
+        end_idle_since_tick = 0;
+        return;
+    }
+    if ( state != Motor::State::IDLE ){
+        end_idle_since_tick = 0;
+        return;
+    }
+    const TickType_t now = xTaskGetTickCount();
+    if ( end_idle_since_tick == 0 ){
+        end_idle_since_tick = now;
+        return;
+    }
+    if ( (now - end_idle_since_tick) >= pdMS_TO_TICKS(END_IDLE_MS) ){
+        const double opening = (end_confirm_dir == 1) ? 100.0 : 0.0;
+        arrive_at_end(opening, config.motor_stroke_time, config.motor_turn_seconds);
+    }
+}
+
 static bool in_calibrating(void){
     return (ventilate_service_status == VentilateService::Status::CALIBRATING_STAGE1)
         || (ventilate_service_status == VentilateService::Status::CALIBRATING_STAGE2)
@@ -442,6 +708,13 @@ static void stop_at_travel_limits(const Config_t &config){
         /* Home is current==0, not software 0 percent. */
         return;
     }
+    if ( end_stop_latched || (end_confirm_dir != 0) ){
+        return;
+    }
+    /* 开/关到底：只靠电流连续≈0 满 3s，不按软件 0%/100% 提前进确认. */
+    if ( seeking_mechanical_end() ){
+        return;
+    }
     int64_t cnt = 0;
     Motor::State state = Motor::State::IDLE;
     motor->get_timer_cnt(cnt);
@@ -451,17 +724,11 @@ static void stop_at_travel_limits(const Config_t &config){
     const bool opening_now = (state == Motor::State::RUNNING_FORWARD)
         || force_open
         || (opening_percentage_set > 0.5);
-    if ( shown <= 0 ){
+    /* 到软件端 / 接近 0：差得不多也进关端 5s 确认. */
+    if ( close_enough_to_zero(cnt, config.motor_stroke_time, config.motor_turn_seconds) ){
         if ( (force_open == false) && (state != Motor::State::RUNNING_FORWARD)
              && (opening_percentage_set <= 0.5) ){
-            const bool first_cut = (end_stop_latched == false) || (state != Motor::State::IDLE);
-            hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
-            force_action = VentilateService::ForceAction::None;
-            motor->set_ignore_stall(false);
-            end_stop_latched = true;
-            if ( first_cut ){
-                LOG_INFO("Stop at 0 percent, cut power.");
-            }
+            begin_end_confirm(2);
             return;
         }
     }
@@ -473,70 +740,38 @@ static void stop_at_travel_limits(const Config_t &config){
     const bool aligning = (ventilate_service_status == VentilateService::Status::ALIGN);
     const bool idle = (state == Motor::State::IDLE);
     if ( EndStopPolicy::should_stop_close(force_open, closing, aligning, align_loop_cnt, idle, shown, opening_now) ){
-        hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
-        force_action = VentilateService::ForceAction::None;
-        motor->set_ignore_stall(false);
-        end_stop_latched = true;
-        LOG_INFO("Stop at 0 percent.");
+        begin_end_confirm(2);
     }else if ( (state == Motor::State::RUNNING_FORWARD) && (shown >= 100) ){
         if ( force_action != VentilateService::ForceAction::ForceClose ){
-            hold_opening(100.0, config.motor_stroke_time, config.motor_turn_seconds);
-            force_action = VentilateService::ForceAction::None;
-            motor->set_ignore_stall(false);
-            end_stop_latched = true;
-            LOG_INFO("Stop at 100 percent.");
+            begin_end_confirm(1);
         }
+    }else if ( (shown >= 100) && (opening_percentage_set >= 99.5)
+                && (force_action != VentilateService::ForceAction::ForceClose)
+                && (state != Motor::State::RUNNING_REVERSE) ){
+        begin_end_confirm(1);
     }
-}
-
-static bool near_end_for_current_snap(bool want_open, int stroke_turns, int turn_seconds){
-    /* 仅在接近目标/端点时认电流≈0 为限位，避免行程中途误停并吸附开度. */
-    int64_t cnt = 0;
-    motor->get_timer_cnt(cnt);
-    int sec = effective_turn_seconds(turn_seconds);
-    int64_t near = (int64_t)sec * 1000LL; /* 约 1 圈 */
-    if ( near < 1000LL ){
-        near = 1000LL;
-    }
-    double shown = calc_opening_percent(cnt, stroke_turns, turn_seconds);
-    if ( want_open ){
-        if ( shown >= 90.0 ){
-            return true;
-        }
-        if ( target_by_timer ){
-            int64_t d = cnt - target_timer_cnt;
-            if ( d < 0 ){
-                d = -d;
-            }
-            return d <= near;
-        }
-        return false;
-    }
-    if ( shown <= 10.0 ){
-        return true;
-    }
-    if ( target_by_timer ){
-        int64_t d = cnt - target_timer_cnt;
-        if ( d < 0 ){
-            d = -d;
-        }
-        return d <= near;
-    }
-    return false;
 }
 
 static bool try_snap_end_stop(Motor::State state, double current, int stroke_turns, int turn_seconds){
+    (void)current;
+    (void)stroke_turns;
+    (void)turn_seconds;
     if ( end_stop_latched ){
-        if ( (opening_percentage_set > 0.5)
-             || (state == Motor::State::RUNNING_FORWARD)
-             || (force_action == VentilateService::ForceAction::ForceOpen) ){
+        /* 仅离开当前端点才清锁：停在 100% 时 set>0.5 不能当“离零”，否则每 5s 重复到头/狂发 MQTT. */
+        if ( (opening_percentage_curr <= 0.5)
+             && ((opening_percentage_set > 0.5)
+                 || (state == Motor::State::RUNNING_FORWARD)
+                 || (force_action == VentilateService::ForceAction::ForceOpen)) ){
             end_stop_latched = false;
+            reset_end_confirm();
             return false;
         }
-        if ( (opening_percentage_set < 99.5) && (opening_percentage_curr >= 99.5)
+        if ( (opening_percentage_curr >= 99.5)
+             && (opening_percentage_set < 99.5)
              && ((state == Motor::State::RUNNING_REVERSE)
                  || (force_action == VentilateService::ForceAction::ForceClose)) ){
             end_stop_latched = false;
+            reset_end_confirm();
             return false;
         }
         if ( (state == Motor::State::RUNNING_FORWARD) || (state == Motor::State::RUNNING_REVERSE) ){
@@ -544,40 +779,12 @@ static bool try_snap_end_stop(Motor::State state, double current, int stroke_tur
         }
         return true;
     }
-    if ( state != Motor::State::IDLE ){
-        return false;
-    }
-    if ( current >= 0.2 ){
-        return false;
-    }
-    /* 电流≈0 判机械限位：必须已接近目标/端点，否则中途假零流会提前吸附. */
-    if ( (open_run_latched != false)
-         && (opening_percentage_set >= 99.5)
-         && near_end_for_current_snap(true, stroke_turns, turn_seconds) ){
-        hold_opening(100.0, stroke_turns, turn_seconds);
-        end_stop_latched = true;
-        LOG_INFO("End stop (current), set 100 percent.");
+    /* 确认中：不再下发新驱动，等 IDLE 满 5s. */
+    if ( end_confirm_dir != 0 ){
         return true;
     }
-    if ( (close_run_latched != false)
-         && (opening_percentage_set <= 0.5)
-         && near_end_for_current_snap(false, stroke_turns, turn_seconds) ){
-        hold_opening(0.0, stroke_turns, turn_seconds);
-        end_stop_latched = true;
-        LOG_INFO("End stop (current), set 0 percent.");
-        return true;
-    }
+    /* 开/关到底停转由 process_end_zero_limit（电流≈0 连续 3s）负责，这里不因 IDLE 秒进确认. */
     return false;
-}
-
-static void stop_force_and_hold(double opening){
-    Config_t cfg;
-    ConfigService::get_config(cfg);
-    motor->set_ignore_stall(false);
-    force_motion_seen = false;
-    hold_opening(opening, cfg.motor_stroke_time, cfg.motor_turn_seconds);
-    force_action = VentilateService::ForceAction::None;
-    LOG_INFO("Force stop at %d percent.", (int)opening_percentage_curr);
 }
 
 bool VentilateService::init(){
@@ -715,6 +922,8 @@ void VentilateService::eventloop(){
     motor->eventloop();
     heal_negative_timer();
     stop_at_travel_limits(config);
+    process_end_zero_limit(config);
+    /* 先跑动作逻辑（含刚停转时 begin_end_confirm），再累计 IDLE 5s. */
     if ( force_action == VentilateService::ForceAction::None ){
         /* 无强制动作. */
         if ( ventilate_service_status == VentilateService::Status::ALIGN ){
@@ -859,15 +1068,34 @@ void VentilateService::eventloop(){
                 }
                 int64_t delta = motor_timer_cnt - target_timer_cnt;
                 int64_t abs_delta = (delta < 0) ? -delta : delta;
-                /* 远离目标时忽略假零流；接近目标后恢复，便于机械限位吸附. */
-                motor->set_ignore_stall(abs_delta > near);
-                if ( delta > deadband ){
+                const int live = opening_to_int(opening_percentage_curr);
+                const bool want_close_end = (opening_percentage_set <= 0.5);
+                const bool want_open_end = (opening_percentage_set >= 99.5);
+                release_end_seek_if_near(live);
+                /* 开/关到底：堵转(电流≈0×3s)或到 0%/100% 停（process_end_zero_limit）；中间圈数按计时到位. */
+                if ( want_close_end ){
+                    arm_close_to_mechanical_end();
+                    if ( motor_state == Motor::State::RUNNING_REVERSE ){
+                        force_motion_seen = true;
+                    }else if ( end_confirm_dir == 0 ){
+                        drive(Motor::Action::REVERSE);
+                    }
+                }else if ( want_open_end ){
+                    arm_open_to_mechanical_end();
+                    if ( motor_state == Motor::State::RUNNING_FORWARD ){
+                        force_motion_seen = true;
+                    }else if ( end_confirm_dir == 0 ){
+                        drive(Motor::Action::FORWARD);
+                    }
+                }else if ( delta > deadband ){
+                    motor->set_ignore_stall(abs_delta > near);
                     drive(Motor::Action::REVERSE);
                 }else if ( delta < -deadband ){
+                    motor->set_ignore_stall(abs_delta > near);
                     drive(Motor::Action::FORWARD);
                 }else{
                     motor->set_ignore_stall(false);
-                    motor->execute_action(Motor::Action::STOP);
+                    drive(Motor::Action::STOP);
                     motor->set_timer_cnt(target_timer_cnt);
                     opening_percentage_curr = clamp_opening(
                         calc_opening_percent(target_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds));
@@ -876,7 +1104,6 @@ void VentilateService::eventloop(){
                     close_run_latched = false;
                     open_run_latched = false;
                     ventilate_service_status = VentilateService::Status::STOPPED;
-                    /* 停稳约 1s 后再按整秒落盘，避免刚停就擦 Flash. */
                     persisted_opening = -1;
                     persisted_timer_sec = -1;
                     pending_persist_opening = -1;
@@ -884,15 +1111,19 @@ void VentilateService::eventloop(){
                              (int)target_timer_cnt, (int)(target_timer_cnt / 1000LL));
                 }
             }else if ( opening_percentage_set >= 100.0 ){
-                if ( opening_to_int(opening_percentage_curr) >= 100 ){
-                    hold_opening(100.0, config.motor_stroke_time, config.motor_turn_seconds);
-                }else{
+                release_end_seek_if_near(opening_to_int(opening_percentage_curr));
+                arm_open_to_mechanical_end();
+                if ( motor_state == Motor::State::RUNNING_FORWARD ){
+                    force_motion_seen = true;
+                }else if ( end_confirm_dir == 0 ){
                     drive(Motor::Action::FORWARD);
                 }
             }else if ( opening_percentage_set <= 0.0 ){
-                if ( opening_to_int(opening_percentage_curr) <= 0 ){
-                    hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
-                }else{
+                release_end_seek_if_near(opening_to_int(opening_percentage_curr));
+                arm_close_to_mechanical_end();
+                if ( motor_state == Motor::State::RUNNING_REVERSE ){
+                    force_motion_seen = true;
+                }else if ( end_confirm_dir == 0 ){
                     drive(Motor::Action::REVERSE);
                 }
             }else{
@@ -918,6 +1149,11 @@ void VentilateService::eventloop(){
                 }
             }
         }
+    }else if ( end_confirm_dir != 0 ){
+        /* 确认中必须允许堵转/零流停机，否则 home_seek 会一直转、5s 永远等不到. */
+        motor->set_home_seek(false);
+        motor->set_ignore_stall(false);
+        motor->set_ignore_zero_current(false);
     }else{
         int64_t motor_timer_cnt = 0;
         Motor::State motor_state = Motor::State::IDLE;
@@ -942,34 +1178,24 @@ void VentilateService::eventloop(){
             force_motion_seen = true;
         }
 
-        if ( (force_action == VentilateService::ForceAction::ForceOpen) && (opening_to_int(opening) >= 100) ){
-            stop_force_and_hold(100.0);
-        }else if ( (force_action == VentilateService::ForceAction::ForceClose) && (opening_to_int(opening) <= 0) ){
-            stop_force_and_hold(0.0);
-        }else if ( motor_state == Motor::State::IDLE ){
+        /* 接近软件端后恢复堵转检测，才能在机械限位停住. */
+        const int shown = opening_to_int(opening);
+        release_end_seek_if_near(shown);
+
+        if ( motor_state == Motor::State::IDLE ){
             if ( force_action == VentilateService::ForceAction::ForceOpen ){
-                /* 转过之后电流≈0：须接近开端才认限位. */
-                if ( (force_motion_seen != false) && (current < 0.2)
-                     && near_end_for_current_snap(true, config.motor_stroke_time, config.motor_turn_seconds) ){
-                    stop_force_and_hold(100.0);
-                }else if ( opening_to_int(opening) >= 100 ){
-                    stop_force_and_hold(100.0);
+                /* 转着等电流连续≈0 满 3s 再停；随后 IDLE 5s 到头. */
+                arm_open_to_mechanical_end();
+                if ( motor_state == Motor::State::RUNNING_FORWARD ){
+                    force_motion_seen = true;
                 }else{
-                    opening_percentage_set = 100.0;
-                    open_run_latched = true;
-                    motor->set_ignore_stall(true);
                     motor->execute_action(Motor::Action::FORWARD);
                 }
             }else if ( force_action == VentilateService::ForceAction::ForceClose ){
-                if ( (force_motion_seen != false) && (current < 0.2)
-                     && near_end_for_current_snap(false, config.motor_stroke_time, config.motor_turn_seconds) ){
-                    stop_force_and_hold(0.0);
-                }else if ( opening_to_int(opening) <= 0 ){
-                    stop_force_and_hold(0.0);
+                arm_close_to_mechanical_end();
+                if ( motor_state == Motor::State::RUNNING_REVERSE ){
+                    force_motion_seen = true;
                 }else{
-                    opening_percentage_set = 0.0;
-                    close_run_latched = true;
-                    motor->set_ignore_stall(true);
                     motor->execute_action(Motor::Action::REVERSE);
                 }
             }else{
@@ -978,12 +1204,14 @@ void VentilateService::eventloop(){
         }else if ( motor_state == Motor::State::ERROR_OVC ){
             motor->set_ignore_stall(false);
             force_action = VentilateService::ForceAction::None;
+            reset_end_confirm();
         }
     }
 
     /* 自动模式：P5 上限全开、P6 下限全关，中间保持；浮点℃比较.
      * 切到自动若已超限立即动作；手动按键后 auto_manual_override 直到再次切入自动. */
-    if ( (config.working_mode == WorkingMode_Auto)
+    if ( (end_confirm_dir == 0)
+         && (config.working_mode == WorkingMode_Auto)
          && (auto_manual_override == false)
          && (force_action == VentilateService::ForceAction::None)
          && (ventilate_service_status != VentilateService::Status::ALIGN)
@@ -1001,7 +1229,8 @@ void VentilateService::eventloop(){
                                config.motor_stroke_time, config.motor_turn_seconds,
                                force_enter);
         }
-    }else if ( (config.working_mode == WorkingMode_Timing)
+    }else if ( (end_confirm_dir == 0)
+                && (config.working_mode == WorkingMode_Timing)
                 && (force_action == VentilateService::ForceAction::None)
                 && (ventilate_service_status != VentilateService::Status::ALIGN)
                 && (in_calibrating() == false) ){
@@ -1016,7 +1245,10 @@ void VentilateService::eventloop(){
     }
 
     try_persist_stopped_opening();
-    if ( (ventilate_service_status != VentilateService::Status::ALIGN)
+    if ( (end_confirm_dir == 0)
+         && (end_stop_latched == false)
+         && (seeking_mechanical_end() == false)
+         && (ventilate_service_status != VentilateService::Status::ALIGN)
          && (ventilate_service_status != VentilateService::Status::CALIBRATING_STAGE1)
          && (ventilate_service_status != VentilateService::Status::CALIBRATING_STAGE2)
          && (ventilate_service_status != VentilateService::Status::CALIBRATING_STAGE3) ){
@@ -1032,17 +1264,13 @@ void VentilateService::eventloop(){
             || (opening_percentage_set < 99.5)
             || (live_state == Motor::State::RUNNING_REVERSE);
         if ( (shown <= 0) && (leaving_zero == false) ){
-            hold_opening(0.0, config.motor_stroke_time, config.motor_turn_seconds);
-            force_action = VentilateService::ForceAction::None;
-            motor->set_ignore_stall(false);
-            end_stop_latched = true;
+            begin_end_confirm(2);
         }else if ( (shown >= 100) && (leaving_hundred == false) ){
-            hold_opening(100.0, config.motor_stroke_time, config.motor_turn_seconds);
-            force_action = VentilateService::ForceAction::None;
-            motor->set_ignore_stall(false);
-            end_stop_latched = true;
+            begin_end_confirm(1);
         }
     }
+    process_end_confirm(config);
+    report_act_on_motor_state_change();
 }
 
 bool VentilateService::start(){
@@ -1058,11 +1286,22 @@ bool VentilateService::set_opening_percentage(int value){
         return false;
     }
     end_stop_latched = false;
+    reset_end_confirm();
     abort_opening_persist();
     target_by_timer = false;
     opening_percentage_set = clamp_opening((double)value);
     close_run_latched = false;
     open_run_latched = false;
+    force_action = ForceAction::None;
+    force_motion_seen = false;
+    if ( opening_percentage_set <= 0.5 ){
+        arm_close_to_mechanical_end();
+    }else if ( opening_percentage_set >= 99.5 ){
+        arm_open_to_mechanical_end();
+    }else{
+        motor->set_home_seek(false);
+        motor->set_ignore_stall(false);
+    }
     return true;
 }
 
@@ -1101,11 +1340,24 @@ bool VentilateService::set_target_turns(int turns){
         opening_percentage_set = 0.0;
     }
     end_stop_latched = false;
+    reset_end_confirm();
     abort_opening_persist();
+    force_action = ForceAction::None;
     /* 新目标：先清 latch，真正转动后再允许终点吸附. */
     close_run_latched = false;
     open_run_latched = false;
+    force_motion_seen = false;
     target_by_timer = true;
+    if ( turns <= 0 ){
+        /* 定时/自动关到底：与手动关一样，跑机械限位 + IDLE 5s. */
+        arm_close_to_mechanical_end();
+    }else if ( turns >= stroke ){
+        /* 定时/自动开到底：与手动开一样，跑机械限位 + IDLE 5s. */
+        arm_open_to_mechanical_end();
+    }else{
+        motor->set_home_seek(false);
+        motor->set_ignore_stall(false);
+    }
     LOG_INFO("Set target turns %d -> %d s (C2=%d), timer %d, opening %.2f%%.",
              turns, turns * sec, sec, (int)target_timer_cnt, opening_percentage_set);
     return true;
@@ -1117,11 +1369,26 @@ bool VentilateService::get_opening_percentage(int &value){
         value = 0;
         return true;
     }
+    /* 开到位已锁存：开度显示 100，圈数仍用实际计时. */
+    if ( end_stop_latched && (opening_percentage_set >= 99.5) ){
+        value = 100;
+        return true;
+    }
+    if ( end_stop_latched && (opening_percentage_set <= 0.5) ){
+        value = 0;
+        return true;
+    }
     Config_t config;
     ConfigService::get_config(config);
     int64_t motor_timer_cnt = 0;
     if ( motor != nullptr ){
         motor->get_timer_cnt(motor_timer_cnt);
+    }
+    /* 关到头过程中剩余不多：按 0% 显示. */
+    if ( ( (end_confirm_dir == 2) || (close_run_latched && (opening_percentage_set <= 0.5)) )
+         && close_enough_to_zero(motor_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds) ){
+        value = 0;
+        return true;
     }
     double shown = clamp_opening(calc_opening_percent(motor_timer_cnt, config.motor_stroke_time, config.motor_turn_seconds));
     value = (int)(shown + 0.5);
@@ -1137,28 +1404,11 @@ bool VentilateService::get_opening_percentage(int &value){
 bool VentilateService::get_current_turns(int &turns){
     Config_t config;
     ConfigService::get_config(config);
-    int stroke = config.motor_stroke_time;
-    if ( stroke < MOTOR_STROKE_TURNS_MIN ){
-        stroke = MOTOR_STROKE_TURNS_MIN;
-    }else if ( stroke > MOTOR_STROKE_TURNS_MAX ){
-        stroke = MOTOR_STROKE_TURNS_MAX;
-    }
     int sec = config.motor_turn_seconds;
     sec = effective_turn_seconds(sec);
 
     if ( ventilate_service_status == Status::ALIGN ){
         turns = 0;
-        return true;
-    }
-
-    int opening = 0;
-    get_opening_percentage(opening);
-    if ( opening <= 0 ){
-        turns = 0;
-        return true;
-    }
-    if ( opening >= 100 ){
-        turns = stroke;
         return true;
     }
 
@@ -1169,11 +1419,30 @@ bool VentilateService::get_current_turns(int &turns){
     if ( cnt < 0 ){
         cnt = 0;
     }
-    /* timer_cnt 约 1ms/tick；已转秒=cnt/1000。整数圈=秒/C2，未满 1 圈为 0.
-     * 例：C1=10 C2=25 → 满行程 250s 才到 10 圈，不是几秒. */
-    int t = (int)(cnt / (1000LL * (int64_t)sec));
-    if ( t > stroke ){
-        t = stroke;
+    /* 回零/关到位：0 圈；剩余不多也按 0 报. */
+    if ( cnt == 0 ){
+        turns = 0;
+        return true;
+    }
+    if ( end_stop_latched && (opening_percentage_set <= 0.5) ){
+        turns = 0;
+        return true;
+    }
+    if ( (end_confirm_dir == 2)
+         && close_enough_to_zero(cnt, config.motor_stroke_time, sec) ){
+        turns = 0;
+        return true;
+    }
+    if ( close_run_latched && (opening_percentage_set <= 0.5)
+         && close_enough_to_zero(cnt, config.motor_stroke_time, sec) ){
+        turns = 0;
+        return true;
+    }
+
+    /* 开到位也按实际计时报圈数，禁止吸附成 C1. */
+    int t = 0;
+    if ( sec > 0 ){
+        t = (int)(cnt / (1000LL * (int64_t)sec));
     }
     if ( t < 0 ){
         t = 0;
@@ -1185,6 +1454,35 @@ bool VentilateService::get_current_turns(int &turns){
 bool VentilateService::get_status(Status &status){
     status = ventilate_service_status;
     return true;
+}
+
+bool VentilateService::end_confirm_lamp(bool &open_lamp, bool &close_lamp){
+    open_lamp = false;
+    close_lamp = false;
+    if ( end_stop_latched ){
+        return false;
+    }
+    /* 5s 确认中：保持对应灯. */
+    if ( end_confirm_dir == 1 ){
+        open_lamp = true;
+        return true;
+    }
+    if ( end_confirm_dir == 2 ){
+        close_lamp = true;
+        return true;
+    }
+    /* 寻开/关机械限位尚未到头：灯保持到 arrive（含刚停转尚未进确认的间隙）. */
+    if ( (force_action == ForceAction::ForceOpen)
+         || (open_run_latched && (opening_percentage_set >= 99.5)) ){
+        open_lamp = true;
+        return true;
+    }
+    if ( (force_action == ForceAction::ForceClose)
+         || (close_run_latched && (opening_percentage_set <= 0.5)) ){
+        close_lamp = true;
+        return true;
+    }
+    return false;
 }
 
 bool VentilateService::get_motor_state(Motor::State &state){
@@ -1199,9 +1497,11 @@ bool VentilateService::on_mode_changed(void){
     align_stay_closed = false;
     motor->set_home_seek(false);
     motor->set_ignore_stall(false);
+    motor->set_ignore_zero_current(false);
     motor->execute_action(Motor::Action::STOP);
     abort_opening_persist();
     end_stop_latched = false;
+    reset_end_confirm();
 
     int64_t motor_timer_cnt = 0;
     motor->get_timer_cnt(motor_timer_cnt);
@@ -1276,27 +1576,38 @@ bool VentilateService::force(ForceAction action){
             motor->set_home_seek(false);
             ventilate_service_status = Status::STOPPED;
         }
-        /* 手动开/关：按 C1 满开圈数或 0 圈定点，到圈停（不再一路跑到电流限位）. */
+        /* 手动开/关：一路跑到机械限位；先不停转，IDLE 满 5s 再灭灯上报暂停（不按 C1 圈数到点即停）. */
         Config_t cfg;
         ConfigService::get_config(cfg);
-        int stroke = cfg.motor_stroke_time;
-        if ( stroke < MOTOR_STROKE_TURNS_MIN ){
-            stroke = MOTOR_STROKE_TURNS_MIN;
-        }else if ( stroke > MOTOR_STROKE_TURNS_MAX ){
-            stroke = MOTOR_STROKE_TURNS_MAX;
-        }
-        force_action = ForceAction::None;
+        force_action = action;
         force_motion_seen = false;
-        motor->set_ignore_stall(false);
+        target_by_timer = false;
         end_stop_latched = false;
-        const int target_turns = (action == ForceAction::ForceOpen) ? stroke : 0;
-        /* 自动：按键后锁定温控；定时：按键只停当前动作. */
+        reset_end_confirm();
+        abort_opening_persist();
         note_manual_override();
         auto_hold_pending = false;
-        auto_hold_baseline = target_turns;
-        LOG_INFO("Manual %s -> target turns %d.",
-                 (action == ForceAction::ForceOpen) ? "open" : "close", target_turns);
-        return set_target_turns(target_turns);
+        if ( action == ForceAction::ForceOpen ){
+            opening_percentage_set = 100.0;
+            open_run_latched = true;
+            close_run_latched = false;
+            auto_hold_baseline = cfg.motor_stroke_time;
+            arm_open_to_mechanical_end();
+            motor->execute_action(Motor::Action::FORWARD);
+            LOG_INFO("Manual open -> run to end stop, wait IDLE 5s.");
+        }else{
+            opening_percentage_set = 0.0;
+            close_run_latched = true;
+            open_run_latched = false;
+            auto_hold_baseline = 0;
+            arm_close_to_mechanical_end();
+            motor->execute_action(Motor::Action::REVERSE);
+            LOG_INFO("Manual close -> run to end stop, wait IDLE 5s.");
+        }
+        if ( (ventilate_service_status != Status::ALIGN) && (in_calibrating() == false) ){
+            ventilate_service_status = Status::STOPPED;
+        }
+        return true;
     }else if ( action == ForceAction::None || action == ForceAction::ForceStop ){
         LOG_INFO("Motor stopped.");
         Config_t config;
@@ -1308,6 +1619,8 @@ bool VentilateService::force(ForceAction action){
         open_run_latched = false;
         force_motion_seen = false;
         abort_opening_persist();
+        end_stop_latched = false;
+        reset_end_confirm();
         note_manual_override();
         auto_hold_pending = false;
         if ( auto_manual_override == false ){
@@ -1317,6 +1630,7 @@ bool VentilateService::force(ForceAction action){
         align_stay_closed = false;
         motor->set_home_seek(false);
         motor->set_ignore_stall(false);
+        motor->set_ignore_zero_current(false);
         int64_t motor_timer_cnt = 0;
         motor->execute_action(Motor::Action::STOP);
         motor->get_timer_cnt(motor_timer_cnt);

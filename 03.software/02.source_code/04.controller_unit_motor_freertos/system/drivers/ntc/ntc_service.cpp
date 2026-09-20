@@ -93,7 +93,8 @@ bool NTC_Service::get_temperature(double &temperature){
     static unsigned int ntc_log_cnt = 0;
     if ( (ntc_log_cnt++ % 5u) == 0u ){
         unsigned int mv = (unsigned int)((adc_value * (unsigned int)NTC_VDDA_MV + (ADC_FULL_SCALE / 2u)) / ADC_FULL_SCALE);
-        LOG_INFO("NTC adc %u (%u mV), R %u ohm, temp %.1f C.", (unsigned int)adc_value, mv, (unsigned int)r_ntc, temperature);
+        LOG_INFO("NTC adc %u (%u mV), R %u ohm, temp %d C.",
+                 (unsigned int)adc_value, mv, (unsigned int)r_ntc, (int)temperature);
     }
     return true;
 }

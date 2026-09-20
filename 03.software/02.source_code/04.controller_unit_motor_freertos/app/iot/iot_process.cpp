@@ -10,6 +10,8 @@
 extern void IOTService_up_config();
 extern void IOTService_up_status();
 extern void IOTService_request_up_status();
+extern void IOTService_request_up_status_run(uint8_t run);
+extern void IOTService_request_up_act(uint8_t act, uint16_t param);
 extern void IOTService_request_up_config();
 
 void process_act_msg(uint8_t act, uint16_t param){
@@ -17,6 +19,8 @@ void process_act_msg(uint8_t act, uint16_t param){
     switch ( act ){
         case 0: {
             VentilateService::force(VentilateService::ForceAction::None);
+            /* APP 下发暂停后，回 up/act + up/status. */
+            IOTService_request_up_act(0, 0);
             break;
         }
         case 1: {
@@ -41,18 +45,22 @@ void process_act_msg(uint8_t act, uint16_t param){
             if ( VentilateService::set_target_turns(turns) == false ){
                 LOG_WARN("MQTT set turns rejected (ALIGN/calibrate).");
             }
+            /* 定点圈数：回 up/act(1,圈数)，并同步 status 开/关意图. */
+            IOTService_request_up_act(1, (uint16_t)turns);
             break;
         }
         case 2: {
             if ( VentilateService::force(VentilateService::ForceAction::ForceOpen) == false ){
                 LOG_WARN("MQTT force open rejected.");
             }
+            IOTService_request_up_act(2, 0);
             break;
         }
         case 3: {
             if ( VentilateService::force(VentilateService::ForceAction::ForceClose) == false ){
                 LOG_WARN("MQTT force close rejected.");
             }
+            IOTService_request_up_act(3, 0);
             break;
         }
         case 4: {
@@ -121,6 +129,8 @@ void process_config_msg(
     ConfigService::request_store();
     if ( old_mode != config.working_mode ){
         VentilateService::on_mode_changed();
+        /* 切模式先停：上报暂停，APP 同步停态. */
+        IOTService_request_up_act(0, 0);
     }
     ConfigService::get_config(config);
     if ( has_ext_fields

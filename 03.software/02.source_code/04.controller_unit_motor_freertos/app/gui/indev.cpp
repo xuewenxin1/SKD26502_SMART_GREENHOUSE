@@ -72,8 +72,20 @@ static ButtonAdapter *button_adapter_minus = nullptr;
 static void button_click_callbacks(char status,int extra){
     if ( status == '.' ){
         GUI::Button button = static_cast<GUI::Button>(extra);
+        /* 开/关/暂停已在按下时处理，松手不再重复. */
+        if ( (button == GUI::Button::Plus)
+             || (button == GUI::Button::Minus)
+             || (button == GUI::Button::Setting) ){
+            return;
+        }
         GUI::button_callback(button,GUI::ButtonEvent::Click);
     }
+}
+
+static void button_short_press_callbacks(int extra){
+    GUI::Button button = static_cast<GUI::Button>(extra);
+    /* 按下即响应：避免“按住等松手”感觉像晚 1～2 秒. */
+    GUI::button_callback(button,GUI::ButtonEvent::Click);
 }
 
 static void button_long_press_callbacks(int extra){
@@ -124,6 +136,7 @@ bool Indev::init(){
         return false;
     }
     button_setting->setClickCallback(button_click_callbacks,static_cast<int>(GUI::Button::Setting));
+    button_setting->setShortPressCallback(button_short_press_callbacks,static_cast<int>(GUI::Button::Setting));
     button_setting->setLongPressCallback(button_long_press_callbacks,static_cast<int>(GUI::Button::Setting));
 
     /* 加按键. */
@@ -136,6 +149,7 @@ bool Indev::init(){
         return false;
     }
     button_plus->setClickCallback(button_click_callbacks,static_cast<int>(GUI::Button::Plus));
+    button_plus->setShortPressCallback(button_short_press_callbacks,static_cast<int>(GUI::Button::Plus));
     button_plus->setLongPressCallback(button_long_press_callbacks,static_cast<int>(GUI::Button::Plus));
     button_plus->setLongPressRepeatTickCount(40);
 
@@ -149,6 +163,7 @@ bool Indev::init(){
         return false;
     }
     button_minus->setClickCallback(button_click_callbacks,static_cast<int>(GUI::Button::Minus));
+    button_minus->setShortPressCallback(button_short_press_callbacks,static_cast<int>(GUI::Button::Minus));
     button_minus->setLongPressCallback(button_long_press_callbacks,static_cast<int>(GUI::Button::Minus));
     button_minus->setLongPressRepeatTickCount(40);
 

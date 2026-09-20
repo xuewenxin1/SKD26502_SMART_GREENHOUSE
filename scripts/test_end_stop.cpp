@@ -16,11 +16,11 @@ static void expect(bool ok, const char *name){
 int main(){
     using namespace EndStopPolicy;
 
-    /* 关到限位：电机已停(idle)，灯必须灭. */
-    expect(should_stop_close(false, true, false, 0, true, 40) == true,
-           "close_hit_limit_idle_stop");
+    /* 关到一半因假零流 IDLE：与开窗一样不停死、不吸成 0%，下一拍继续关. */
+    expect(should_stop_close(false, true, false, 0, true, 40) == false,
+           "close_mid_idle_keep_going");
     expect(close_lamp_on(false, 40) == false,
-           "close_hit_limit_idle_lamp_off");
+           "close_mid_idle_lamp_off");
 
     /* 关、屏幕已到 0%、电机还在反转：必须停，灯灭. */
     expect(shown_percent(0.2) == 0, "display_0_from_0p2");

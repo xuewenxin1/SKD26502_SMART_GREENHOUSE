@@ -17,6 +17,7 @@ void process_act_msg(uint8_t act, uint16_t param){
     switch ( act ){
         case 0: {
             VentilateService::force(VentilateService::ForceAction::None);
+            IOTService_request_up_status();
             break;
         }
         case 1: {
@@ -41,18 +42,21 @@ void process_act_msg(uint8_t act, uint16_t param){
             if ( VentilateService::set_target_turns(turns) == false ){
                 LOG_WARN("MQTT set turns rejected (ALIGN/calibrate).");
             }
+            IOTService_request_up_status();
             break;
         }
         case 2: {
             if ( VentilateService::force(VentilateService::ForceAction::ForceOpen) == false ){
                 LOG_WARN("MQTT force open rejected.");
             }
+            IOTService_request_up_status();
             break;
         }
         case 3: {
             if ( VentilateService::force(VentilateService::ForceAction::ForceClose) == false ){
                 LOG_WARN("MQTT force close rejected.");
             }
+            IOTService_request_up_status();
             break;
         }
         case 4: {

@@ -104,9 +104,6 @@ bool TM1750_Service::flush(){
     if ( tm1750 == nullptr ){
         return false;
     }
-    /* 软件 I2C 不能被 Flash/其它任务打断，否则 TM1750 会停在最后一帧. */
-    taskENTER_CRITICAL();
-    bool ok = tm1750->flush();
-    taskEXIT_CRITICAL();
-    return ok;
+    /* 禁止关总中断刷屏：会丢 4G UART，导致假死（时间/配网码停、按键失灵）. */
+    return tm1750->flush();
 }

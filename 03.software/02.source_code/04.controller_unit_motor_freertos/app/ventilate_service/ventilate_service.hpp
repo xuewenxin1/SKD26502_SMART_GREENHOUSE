@@ -42,6 +42,8 @@ bool get_opening_percentage(int &value);
 /* 当前已走完的整数圈数；未满一圈为 0. */
 bool get_current_turns(int &turns);
 bool get_status(Status &status);
+/* 限位确认中：开/关灯保持亮，直到电机 IDLE 满 5s 判到头. */
+bool end_confirm_lamp(bool &open_lamp, bool &close_lamp);
 
 bool get_motor_state(Motor::State &state);
 

@@ -109,7 +109,7 @@ static char g_mccid[21] = {0};
 static char g_imei[16] = {0};
 
 static void message(const char *topic, const char *payload, unsigned int length){
-    LOG_INFO("MQTT topic:%s msg(%d):%s",topic,length,payload);
+    LOG_DEBUG("MQTT down len=%u", length);
     if ( g_imei_flag ){
         const char *t = topic;
         if ( *t == '"' ){
@@ -122,7 +122,7 @@ static void message(const char *topic, const char *payload, unsigned int length)
             return;
         }
     }
-    /* 新 config 包 23 字节 → Base64 正好 32 字符；缓冲需大于 32. */
+    /* 新 config 包含温度校准约 25 字节 → Base64 需大于 32. */
     char payload_buffer[64] = {0};
     unsigned char buffer[64] = {0};
 
@@ -146,8 +146,6 @@ static void message(const char *topic, const char *payload, unsigned int length)
         checksum_calculator.feed(buffer,len - 1);
         unsigned char f_checksum = checksum_calculator.get();
         if ( f_checksum == buffer[len - 1] ){
-            /* 校验通过. */
-            LOG_INFO("Decoded payload len:%d",len);
             process_iot_down(topic,buffer,(unsigned int)len);
         }else{
             LOG_WARN("MQTT checksum fail, len %d.", len);
@@ -259,7 +257,7 @@ static void IOTService_wait_ms(unsigned int ms){
     }
     while ( (xTaskGetTickCount() - start) < wait ){
         IOTService_drain_rx();
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
     IOTService_drain_rx();
 }
@@ -662,7 +660,7 @@ static void IOTService_task(void *param){
 }
 
 bool IOTService::start(){
-    if ( xTaskCreate(IOTService_task,"iot",384,nullptr,10,&task_handle_iot) != pdPASS ){
+    if ( xTaskCreate(IOTService_task,"iot",448,nullptr,4,&task_handle_iot) != pdPASS ){
         LOG_ERROR("IOT task start failed.");
         return false;
     }

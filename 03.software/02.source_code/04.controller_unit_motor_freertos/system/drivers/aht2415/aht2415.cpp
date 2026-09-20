@@ -29,11 +29,12 @@ bool AHT2415::read(double &temperature, double &humidity){
     buffer[1] = 0x33;
     buffer[2] = 0x00;
     this->twi_master.write(AHT2415_HWADDR,buffer,3);
+    /* 最多等 2 拍：未插探头时旧逻辑可堵满 ~800ms，拖死 Main 电机调度. */
     do {
         this->portable_strategy.delay_ms(80);
         this->twi_master.read(AHT2415_HWADDR,buffer,7);
-    } while (buffer[0] & 0x80 && timeout++ < 10);
-    if ( timeout >= 10 ){
+    } while ( (buffer[0] & 0x80) && (timeout++ < 2) );
+    if ( timeout >= 2 ){
         return false;
     }
     /* 未插温湿度计：总线常读到全 0 或全 0xFF，当作无效. */
